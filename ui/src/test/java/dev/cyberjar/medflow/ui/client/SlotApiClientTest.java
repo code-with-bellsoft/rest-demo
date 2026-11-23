@@ -1,0 +1,276 @@
+package dev.cyberjar.medflow.ui.client;
+
+import com.sun.net.httpserver.HttpServer;
+import com.vaadin.flow.component.Component;
+import com.vaadin.flow.component.UI;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.Pre;
+import com.vaadin.flow.server.VaadinSession;
+import com.vaadin.flow.dom.Element;
+import dev.cyberjar.medflow.ui.dto.CreateSlotRequest;
+import dev.cyberjar.medflow.ui.dto.ReferenceDto;
+import dev.cyberjar.medflow.ui.dto.SlotDto;
+import dev.cyberjar.medflow.ui.dto.UpdateCapacityRequest;
+import dev.cyberjar.medflow.ui.view.SlotView;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.converter.json.JacksonJsonHttpMessageConverter;
+import org.springframework.web.client.RestClient;
+import tools.jackson.databind.json.JsonMapper;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+
+class SlotApiClientTest {
+
+    private static final String SLOT = """
+            {"id":42,"facilityId":2,"facilityName":"Harbor","specialtyId":3,"specialtyName":"Cardiology",
+             "startsAt":"2030-05-01T10:00:00+03:00","endsAt":"2030-05-01T10:30:00+03:00","capacity":2,"activeBookings":2,"remainingCapacity":0}""";
+    private static final String CREATED_SLOT = SLOT.replace("\"activeBookings\":2,\"remainingCapacity\":0",
+            "\"activeBookings\":0,\"remainingCapacity\":2");
+    private static final String FACILITIES = "[{\"id\":2,\"name\":\"Harbor\"}]";
+    private static final String SPECIALTIES = "[{\"id\":3,\"name\":\"Cardiology\"}]";
+
+    private final Queue<Reply> replies = new ConcurrentLinkedQueue<>();
+    private final Queue<SeenRequest> requests = new ConcurrentLinkedQueue<>();
+    private final JsonMapper mapper = JsonMapper.builder().build();
+    private HttpServer server;
+    private URI baseUrl;
+    private SlotApiClient client;
+
+    @BeforeEach
+    void startServer() throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            try (exchange) {
+                requests.add(new SeenRequest(exchange.getRequestMethod(), exchange.getRequestURI().toString(),
+                        exchange.getRequestHeaders().getFirst("Content-Type"),
+                        exchange.getRequestHeaders().getFirst("Accept"),
+                        new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+                var reply = replies.remove();
+                if (reply.contentType() != null) {
+                    exchange.getResponseHeaders().set("Content-Type", reply.contentType());
+                }
+                if (reply.location() != null) {
+                    exchange.getResponseHeaders().set("Location", reply.location());
+                }
+                exchange.getResponseHeaders().set("Set-Cookie", "demo=secret");
+                var bytes = reply.body().getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(reply.status(), bytes.length == 0 ? -1 : bytes.length);
+                exchange.getResponseBody().write(bytes);
+            }
+        });
+        server.start();
+        baseUrl = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
+        var builder = RestClient.builder().configureMessageConverters(
+                converters -> converters.withJsonConverter(new JacksonJsonHttpMessageConverter(mapper)));
+        client = new SlotApiClient(new ApiClientConfig().medFlowRestClient(builder, baseUrl), mapper);
+    }
+
+    @AfterEach
+    void stopServer() {
+        server.stop(0);
+    }
+
+    @Test
+    void readsSlotCollectionAndSendsEachFilterCombination() {
+        for (int i = 0; i < 4; i++) {
+            replies.add(Reply.json(200, "[" + SLOT + "]"));
+        }
+
+        var result = client.slots(null, null);
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.value()).containsExactly(new SlotDto(42L, 2L, "Harbor", 3L, "Cardiology",
+                OffsetDateTime.parse("2030-05-01T10:00:00+03:00"),
+                OffsetDateTime.parse("2030-05-01T10:30:00+03:00"), 2, 2, 0));
+        assertThat(result.exchange().response().body()).isEqualTo("[" + SLOT + "]");
+        assertThat(result.exchange().response().status().value()).isEqualTo(200);
+        client.slots(2L, null);
+        client.slots(null, 3L);
+        client.slots(2L, 3L);
+
+        assertThat(requests).extracting(SeenRequest::path).containsExactly(
+                "/api/slots", "/api/slots?facilityId=2", "/api/slots?specialtyId=3",
+                "/api/slots?facilityId=2&specialtyId=3");
+    }
+
+    @Test
+    void readsFacilitiesAndSpecialties() {
+        replies.add(Reply.json(200, FACILITIES));
+        replies.add(Reply.json(200, SPECIALTIES));
+
+        assertThat(client.facilities().value()).containsExactly(new ReferenceDto(2L, "Harbor"));
+        assertThat(client.specialties().value()).containsExactly(new ReferenceDto(3L, "Cardiology"));
+        assertThat(requests).extracting(SeenRequest::path).containsExactly("/api/facilities", "/api/specialties");
+        assertThat(requests).extracting(SeenRequest::method).containsOnly("GET");
+    }
+
+    @Test
+    void postsJsonAndCapturesTheActualExchangeIncludingLocation() {
+        replies.add(new Reply(201, "application/json", "/api/slots/42", CREATED_SLOT));
+        var start = OffsetDateTime.parse("2030-05-01T07:00:00Z");
+        var result = client.create(new CreateSlotRequest(2L, 3L, start, start.plusMinutes(30), 2));
+        var seen = requests.remove();
+        assertThat(seen.method()).isEqualTo("POST");
+        assertThat(seen.path()).isEqualTo("/api/slots");
+        assertThat(seen.contentType()).isEqualTo("application/json");
+        assertThat(mapper.readTree(seen.body())).isEqualTo(mapper.readTree("""
+                {"facilityId":2,"specialtyId":3,"startsAt":"2030-05-01T07:00:00Z",
+                 "endsAt":"2030-05-01T07:30:00Z","capacity":2}"""));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.value().id()).isEqualTo(42L);
+        var request = result.exchange().request();
+        assertThat(request.method()).isEqualTo(HttpMethod.POST);
+        assertThat(request.uri()).isEqualTo(baseUrl.resolve(seen.path()));
+        assertThat(request.headers().getFirst("Content-Type")).isEqualTo(seen.contentType());
+        assertThat(request.headers().getFirst("Accept")).isEqualTo(seen.accept());
+        assertThat(request.body()).isEqualTo(seen.body());
+
+        var response = result.exchange().response();
+        assertThat(response.statusLine()).isEqualTo("201 Created");
+        assertThat(response.headers().getLocation()).isEqualTo(URI.create("/api/slots/42"));
+        assertThat(response.headers().getFirst("Content-Type")).isEqualTo("application/json");
+        assertThat(response.headers().containsHeader("Set-Cookie")).isFalse();
+        assertThat(response.body()).isEqualTo(CREATED_SLOT);
+    }
+
+    @Test
+    void patchesOnlyCapacityAndLetsTheApiRejectZero() {
+        replies.add(Reply.json(200, SLOT.replace("\"capacity\":2", "\"capacity\":3")
+                .replace("\"remainingCapacity\":0", "\"remainingCapacity\":1")));
+        replies.add(Reply.json(400, "{\"status\":400}"));
+
+        var updated = client.updateCapacity(42L, new UpdateCapacityRequest(3));
+        assertThat(updated.succeeded()).isTrue();
+        assertThat(updated.value().capacity()).isEqualTo(3);
+        assertThat(updated.value().activeBookings()).isEqualTo(2);
+        assertThat(updated.value().remainingCapacity()).isEqualTo(1);
+        assertThat(requests.remove()).isEqualTo(new SeenRequest("PATCH", "/api/slots/42",
+                "application/json", "application/json", "{\"capacity\":3}"));
+
+        var rejected = client.updateCapacity(42L, new UpdateCapacityRequest(0));
+        assertThat(requests.remove().body()).isEqualTo("{\"capacity\":0}");
+        assertThat(rejected.error()).isEqualTo("HTTP 400 Bad Request");
+        assertThat(rejected.exchange().response().body()).isEqualTo("{\"status\":400}");
+    }
+
+    @Test
+    void deletesTheResourceAndHandlesNoContent() {
+        replies.add(new Reply(204, null, null, ""));
+        var result = client.delete(42L);
+
+        assertThat(requests.remove()).isEqualTo(new SeenRequest("DELETE", "/api/slots/42",
+                null, "application/json", ""));
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.exchange().response().statusLine()).isEqualTo("204 No Content");
+        assertThat(result.exchange().response().body()).isEmpty();
+    }
+
+    @Test
+    void preservesErrorBodiesIncludingPlainTextServerErrors() {
+        replies.add(Reply.json(404, "{\"status\":404}"));
+        replies.add(Reply.json(409, "{\"status\":409}"));
+        replies.add(new Reply(503, "text/plain", null, "Service temporarily unavailable"));
+
+        var missing = client.delete(42L);
+        assertThat(missing.error()).isEqualTo("HTTP 404 Not Found");
+        assertThat(missing.exchange().response().body()).isEqualTo("{\"status\":404}");
+        var conflict = client.delete(42L);
+        assertThat(conflict.error()).isEqualTo("HTTP 409 Conflict");
+        assertThat(conflict.exchange().response().body()).isEqualTo("{\"status\":409}");
+        var unavailable = client.slots(null, null);
+        assertThat(unavailable.error()).isEqualTo("HTTP 503 Service Unavailable");
+        assertThat(unavailable.exchange().response().body()).isEqualTo("Service temporarily unavailable");
+    }
+
+    @Test
+    void preservesAttemptedReadAndWriteWhenTheServerStops() {
+        server.stop(0);
+        var read = client.slots(null, null);
+        var write = client.delete(42L);
+
+        assertThat(read.error()).startsWith("Connection failure");
+        assertThat(read.exchange().request().uri()).isEqualTo(baseUrl.resolve("/api/slots"));
+        assertThat(read.exchange().response()).isNull();
+        assertThat(write.error()).startsWith("Connection failure");
+        assertThat(write.exchange().request().uri()).isEqualTo(baseUrl.resolve("/api/slots/42"));
+        assertThat(write.exchange().response()).isNull();
+    }
+
+    @Test
+    void vaadinViewLoadsAndRefreshesThroughHttpAndDisplaysTheOutage() {
+        replies.add(Reply.json(200, FACILITIES));
+        replies.add(Reply.json(200, SPECIALTIES));
+        replies.add(Reply.json(200, "[" + SLOT + "]"));
+        var view = new SlotView(client, mapper);
+        var ui = new UI();
+        ui.getInternals().setSession(mock(VaadinSession.class));
+        UI.setCurrent(ui);
+        try {
+            ui.add(view);
+            view.afterNavigation(null);
+
+            assertThat(requests).extracting(SeenRequest::path)
+                    .containsExactly("/api/facilities", "/api/specialties", "/api/slots");
+            @SuppressWarnings("unchecked")
+            var grid = (Grid<SlotDto>) descendants(view, Grid.class).findFirst().orElseThrow();
+            var slot = grid.getGenericDataView().getItems().findFirst().orElseThrow();
+            assertThat(renderColumn(grid, slot, "Capacity")).isEqualTo(2);
+            assertThat(renderColumn(grid, slot, "Booked")).isEqualTo(2);
+            assertThat(renderColumn(grid, slot, "Remaining")).isZero();
+            grid.select(slot);
+            assertThat(descendants(view, Button.class)
+                    .filter(button -> button.getText().equals("Edit capacity") || button.getText().equals("Delete"))
+                    .filter(Button::isEnabled).count()).isEqualTo(2);
+            assertThat(descendants(view, Pre.class).map(Pre::getText))
+                    .anyMatch(text -> text.startsWith("200 OK") && text.contains("Cardiology")
+                            && text.contains("\"activeBookings\" : 2") && text.contains("\"remainingCapacity\" : 0"));
+
+            server.stop(0);
+            descendants(view, Button.class).filter(button -> button.getText().equals("Refresh"))
+                    .findFirst().orElseThrow().click();
+            assertThat(grid.getGenericDataView().getItems().count()).isZero();
+            assertThat(descendants(view, Pre.class).map(Pre::getText))
+                    .contains("Connection failure · No HTTP response.");
+        } finally {
+            UI.setCurrent(null);
+        }
+    }
+
+    private int renderColumn(Grid<SlotDto> grid, SlotDto slot, String header) {
+        var column = grid.getColumns().stream().filter(candidate -> header.equals(candidate.getHeaderText()))
+                .findFirst().orElseThrow();
+        var element = new Element("vaadin-grid-column");
+        var data = mapper.createObjectNode();
+        column.getRenderer().render(element, grid.getDataCommunicator().getKeyMapper(), null)
+                .getDataGenerator().orElseThrow().generateData(slot, data);
+        return data.required(element.getProperty("path")).asInt();
+    }
+
+    private static <T extends Component> Stream<T> descendants(Component root, Class<T> type) {
+        return Stream.concat(Stream.of(root),
+                root.getChildren().flatMap(child -> descendants(child, Component.class)))
+                .filter(type::isInstance).map(type::cast);
+    }
+
+    private record Reply(int status, String contentType, String location, String body) {
+        static Reply json(int status, String body) {
+            return new Reply(status, "application/json", null, body);
+        }
+    }
+
+    private record SeenRequest(String method, String path, String contentType, String accept, String body) {
+    }
+}

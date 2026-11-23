@@ -33,3 +33,14 @@ build/
 .vscode/
 .DS_Store
 .env
+
+# Vaadin frontend build output
+/ui/node_modules/
+/ui/package.json
+/ui/package-lock.json
+/ui/pnpm-lock.yaml
+/ui/tsconfig.json
+/ui/types.d.ts
+/ui/vite.config.ts
+/ui/vite.generated.ts
+/ui/src/main/frontend/generated/

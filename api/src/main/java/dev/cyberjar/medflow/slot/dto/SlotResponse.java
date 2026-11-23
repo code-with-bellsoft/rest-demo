@@ -10,6 +10,8 @@ public record SlotResponse(
         String specialtyName,
         OffsetDateTime startsAt,
         OffsetDateTime endsAt,
-        int capacity
+        int capacity,
+        int activeBookings,
+        int remainingCapacity
 ) {
 }

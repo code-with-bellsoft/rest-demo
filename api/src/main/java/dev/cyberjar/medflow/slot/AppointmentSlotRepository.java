@@ -4,7 +4,9 @@ import dev.cyberjar.medflow.enums.BookingStatus;
 import dev.cyberjar.medflow.exception.SlotConflictException;
 import dev.cyberjar.medflow.slot.dto.SlotRequest;
 import dev.cyberjar.medflow.slot.dto.SlotResponse;
+import org.jooq.Condition;
 import org.jooq.DSLContext;
+import org.jooq.Field;
 import org.jooq.Record;
 import org.jooq.SelectOnConditionStep;
 import org.jooq.impl.DSL;
@@ -17,10 +19,14 @@ import static dev.cyberjar.medflow.Tables.APPOINTMENT_SLOT;
 import static dev.cyberjar.medflow.Tables.BOOKING;
 import static dev.cyberjar.medflow.Tables.FACILITY;
 import static dev.cyberjar.medflow.Tables.SPECIALTY;
+import static org.jooq.impl.DSL.coalesce;
+import static org.jooq.impl.DSL.count;
 import static org.jooq.impl.DSL.noCondition;
 
 @Repository
 public class AppointmentSlotRepository {
+
+    private static final Field<Integer> ACTIVE_BOOKINGS = count().as("active_bookings");
 
     private final DSLContext db;
 
@@ -106,20 +112,33 @@ public class AppointmentSlotRepository {
         return ctx.fetchCount(
                 BOOKING,
                 BOOKING.APPOINTMENT_SLOT_ID.eq(id),
-                BOOKING.STATUS.in(BookingStatus.RESERVED, BookingStatus.CONFIRMED)
+                activeBooking()
         );
     }
 
+    private Condition activeBooking() {
+        return BOOKING.STATUS.in(BookingStatus.RESERVED, BookingStatus.CONFIRMED);
+    }
+
     private SelectOnConditionStep<?> selectSlots(DSLContext ctx) {
+        var bookingCounts = ctx.select(BOOKING.APPOINTMENT_SLOT_ID, ACTIVE_BOOKINGS)
+                .from(BOOKING)
+                .where(activeBooking())
+                .groupBy(BOOKING.APPOINTMENT_SLOT_ID)
+                .asTable("booking_counts");
         return ctx.select(APPOINTMENT_SLOT.ID, APPOINTMENT_SLOT.FACILITY_ID, FACILITY.NAME,
                         APPOINTMENT_SLOT.SPECIALTY_ID, SPECIALTY.NAME,
-                        APPOINTMENT_SLOT.STARTS_AT, APPOINTMENT_SLOT.ENDS_AT, APPOINTMENT_SLOT.CAPACITY)
+                        APPOINTMENT_SLOT.STARTS_AT, APPOINTMENT_SLOT.ENDS_AT, APPOINTMENT_SLOT.CAPACITY,
+                        coalesce(bookingCounts.field(ACTIVE_BOOKINGS), 0).as(ACTIVE_BOOKINGS))
                 .from(APPOINTMENT_SLOT)
                 .join(FACILITY).on(FACILITY.ID.eq(APPOINTMENT_SLOT.FACILITY_ID))
-                .join(SPECIALTY).on(SPECIALTY.ID.eq(APPOINTMENT_SLOT.SPECIALTY_ID));
+                .join(SPECIALTY).on(SPECIALTY.ID.eq(APPOINTMENT_SLOT.SPECIALTY_ID))
+                .leftJoin(bookingCounts).on(bookingCounts.field(BOOKING.APPOINTMENT_SLOT_ID).eq(APPOINTMENT_SLOT.ID));
     }
 
     private SlotResponse toResponse(Record row) {
+        int capacity = row.get(APPOINTMENT_SLOT.CAPACITY);
+        int activeBookings = row.get(ACTIVE_BOOKINGS);
         return new SlotResponse(
                 row.get(APPOINTMENT_SLOT.ID),
                 row.get(APPOINTMENT_SLOT.FACILITY_ID),
@@ -128,7 +147,9 @@ public class AppointmentSlotRepository {
                 row.get(SPECIALTY.NAME),
                 row.get(APPOINTMENT_SLOT.STARTS_AT),
                 row.get(APPOINTMENT_SLOT.ENDS_AT),
-                row.get(APPOINTMENT_SLOT.CAPACITY)
+                capacity,
+                activeBookings,
+                capacity - activeBookings
         );
     }
 }

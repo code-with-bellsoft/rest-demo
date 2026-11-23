@@ -11,117 +11,16 @@
     <groupId>dev.cyberjar</groupId>
     <artifactId>medflow-rest-demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
     <name>MedFlow REST Demo</name>
-    <description>Appointment slot REST API demo</description>
+    <description>Appointment slot REST API and Vaadin client</description>
+
+    <modules>
+        <module>api</module>
+        <module>ui</module>
+    </modules>
 
     <properties>
         <java.version>25</java.version>
     </properties>
-    <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-jooq</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-flyway</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.flywaydb</groupId>
-            <artifactId>flyway-database-postgresql</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webmvc</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webmvc-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>testcontainers-junit-jupiter</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>testcontainers-postgresql</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-            </plugin>
-            <plugin>
-                <groupId>org.jooq</groupId>
-                <artifactId>jooq-codegen-maven</artifactId>
-                <version>${jooq.version}</version>
-                <executions>
-                    <execution>
-                        <id>generate-jooq</id>
-                        <phase>generate-sources</phase>
-                        <goals>
-                            <goal>generate</goal>
-                        </goals>
-                    </execution>
-                </executions>
-                <configuration>
-                    <generator>
-                        <database>
-                            <name>org.jooq.meta.extensions.ddl.DDLDatabase</name>
-
-                            <inputSchema>PUBLIC</inputSchema>
-                            <outputSchema>public</outputSchema>
-
-                            <properties>
-                                <property>
-                                    <key>scripts</key>
-                                    <value>${project.basedir}/src/main/resources/db/migration/schema/*.sql</value>
-                                </property>
-
-                                <property>
-                                    <key>sort</key>
-                                    <value>flyway</value>
-                                </property>
-
-                                <property>
-                                    <key>unqualifiedSchema</key>
-                                    <value>public</value>
-                                </property>
-
-                                <property>
-                                    <key>defaultNameCase</key>
-                                    <value>lower</value>
-                                </property>
-                            </properties>
-                        </database>
-
-                        <target>
-                            <packageName>dev.cyberjar.medflow</packageName>
-                            <directory>${project.build.directory}/generated-sources/jooq</directory>
-                        </target>
-                    </generator>
-                </configuration>
-                <dependencies>
-                    <dependency>
-                        <groupId>org.jooq</groupId>
-                        <artifactId>jooq-meta-extensions</artifactId>
-                        <version>${jooq.version}</version>
-                    </dependency>
-                </dependencies>
-            </plugin>
-        </plugins>
-    </build>
-
 </project>
