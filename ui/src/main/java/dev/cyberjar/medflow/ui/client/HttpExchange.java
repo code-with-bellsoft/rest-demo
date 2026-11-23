@@ -13,7 +13,8 @@ public record HttpExchange(Request request, Response response) {
 
     // Show protocol metadata and omit credential-bearing and unknown custom headers.
     private static final Set<String> VISIBLE_HEADERS = Set.of("accept", "content-type", "content-length",
-            "content-encoding", "transfer-encoding", "date", "cache-control", "location", "vary", "allow");
+            "content-encoding", "transfer-encoding", "date", "cache-control", "location", "vary", "allow",
+            SlotApiClient.VERSION_HEADER.toLowerCase(Locale.ROOT));
 
     static HttpHeaders visibleHeaders(HttpHeaders source) {
         var headers = new HttpHeaders();

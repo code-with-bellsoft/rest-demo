@@ -121,6 +121,12 @@ if [[ "$CHECK_DB" == 1 ]]; then
     exit 1
   fi
 
+  if [[ "${VERIFY_VERSIONING:-0}" == 1 ]]; then
+    API_BASE="$API_BASE" DB_CONTAINER="$DB_CONTAINER" DB_USER="$DB_USER" DB_NAME="$DB_NAME" \
+      "$ROOT/scripts/verify-versioning.sh"
+    exit
+  fi
+
   printf '\n== 4b/5: Verify actual PostgreSQL constraints and booking counts ==\n'
   # SQL blocks below deliberately cannot persist changes: they test invalid INSERTs.
   docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" <<'SQL'

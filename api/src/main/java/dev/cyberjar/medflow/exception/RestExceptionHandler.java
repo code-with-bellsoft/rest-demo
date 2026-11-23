@@ -18,6 +18,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
 import org.springframework.web.ErrorResponse;
 import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.accept.InvalidApiVersionException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -28,6 +29,13 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 
 @RestControllerAdvice
 public class RestExceptionHandler extends ResponseEntityExceptionHandler {
+
+    @ExceptionHandler(InvalidApiVersionException.class)
+    @Nullable ResponseEntity<Object> handleInvalidApiVersion(InvalidApiVersionException ex, WebRequest request) {
+        var problem = ProblemDetail.forStatusAndDetail(ex.getStatusCode(),
+                "Invalid API version. Supported versions are 1.0 and 2.0.");
+        return handleExceptionInternal(ex, problem, ex.getHeaders(), ex.getStatusCode(), request);
+    }
 
     @ExceptionHandler(NotFoundException.class)
     @Nullable ResponseEntity<Object> handleNotFound(NotFoundException ex, WebRequest request) {

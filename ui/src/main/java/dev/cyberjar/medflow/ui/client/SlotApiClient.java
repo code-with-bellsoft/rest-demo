@@ -3,6 +3,7 @@ package dev.cyberjar.medflow.ui.client;
 import dev.cyberjar.medflow.ui.dto.CreateSlotRequest;
 import dev.cyberjar.medflow.ui.dto.ReferenceDto;
 import dev.cyberjar.medflow.ui.dto.SlotDto;
+import dev.cyberjar.medflow.ui.dto.SlotV2Dto;
 import dev.cyberjar.medflow.ui.dto.UpdateCapacityRequest;
 import java.io.IOException;
 import java.net.URI;
@@ -29,10 +30,13 @@ import tools.jackson.databind.json.JsonMapper;
 @Component
 public class SlotApiClient {
 
+    static final String VERSION_HEADER = "API-Version";
     private static final String SLOTS = "/api/slots";
     private final RestClient client;
     private final ObjectReader slotsReader;
     private final ObjectReader slotReader;
+    private final ObjectReader slotsV2Reader;
+    private final ObjectReader slotV2Reader;
     private final ObjectReader referenceReader;
     private final ObjectReader problemReader;
 
@@ -41,38 +45,53 @@ public class SlotApiClient {
         var reader = mapper.reader().without(DateTimeFeature.ADJUST_DATES_TO_CONTEXT_TIME_ZONE);
         slotsReader = reader.forType(new TypeReference<List<SlotDto>>() {});
         slotReader = reader.forType(SlotDto.class);
+        slotsV2Reader = reader.forType(new TypeReference<List<SlotV2Dto>>() {});
+        slotV2Reader = reader.forType(SlotV2Dto.class);
         problemReader = mapper.reader();
         referenceReader = reader.forType(new TypeReference<List<ReferenceDto>>() {});
     }
 
-    public Result<List<SlotDto>> slots(Long facilityId, Long specialtyId) {
-        return send(HttpMethod.GET, uri -> uri.path(SLOTS)
+    public Result<List<SlotDto>> slots(ApiVersion version, Long facilityId, Long specialtyId) {
+        Function<UriBuilder, URI> uri = builder -> builder.path(SLOTS)
                 .queryParamIfPresent("facilityId", Optional.ofNullable(facilityId))
-                .queryParamIfPresent("specialtyId", Optional.ofNullable(specialtyId)).build(), null, slotsReader);
+                .queryParamIfPresent("specialtyId", Optional.ofNullable(specialtyId)).build();
+        if (version == ApiVersion.V2) {
+            return this.<List<SlotV2Dto>>send(HttpMethod.GET, uri, version, null, slotsV2Reader)
+                    .map(slots -> slots.stream().map(SlotV2Dto::toGridSlot).toList());
+        }
+        return send(HttpMethod.GET, uri, version, null, slotsReader);
     }
 
     public Result<List<ReferenceDto>> facilities() {
-        return send(HttpMethod.GET, uri -> uri.path("/api/facilities").build(), null, referenceReader);
+        return send(HttpMethod.GET, uri -> uri.path("/api/facilities").build(), null, null, referenceReader);
     }
 
     public Result<List<ReferenceDto>> specialties() {
-        return send(HttpMethod.GET, uri -> uri.path("/api/specialties").build(), null, referenceReader);
+        return send(HttpMethod.GET, uri -> uri.path("/api/specialties").build(), null, null, referenceReader);
     }
 
-    public Result<SlotDto> create(CreateSlotRequest request) {
-        return send(HttpMethod.POST, uri -> uri.path(SLOTS).build(), request, slotReader);
+    public Result<SlotDto> create(ApiVersion version, CreateSlotRequest request) {
+        return writeSlot(HttpMethod.POST, uri -> uri.path(SLOTS).build(), version, request);
     }
 
-    public Result<SlotDto> updateCapacity(Long id, UpdateCapacityRequest request) {
-        return send(HttpMethod.PATCH, uri -> uri.path(SLOTS + "/{id}").build(id), request, slotReader);
+    public Result<SlotDto> updateCapacity(ApiVersion version, Long id, UpdateCapacityRequest request) {
+        return writeSlot(HttpMethod.PATCH, uri -> uri.path(SLOTS + "/{id}").build(id), version, request);
     }
 
-    public Result<Void> delete(Long id) {
-        return send(HttpMethod.DELETE, uri -> uri.path(SLOTS + "/{id}").build(id), null, null);
+    public Result<Void> delete(ApiVersion version, Long id) {
+        return send(HttpMethod.DELETE, uri -> uri.path(SLOTS + "/{id}").build(id), version, null, null);
+    }
+
+    private Result<SlotDto> writeSlot(HttpMethod method, Function<UriBuilder, URI> uri,
+                                      ApiVersion version, Object body) {
+        if (version == ApiVersion.V2) {
+            return this.<SlotV2Dto>send(method, uri, version, body, slotV2Reader).map(SlotV2Dto::toGridSlot);
+        }
+        return send(method, uri, version, body, slotReader);
     }
 
     private <T> Result<T> send(HttpMethod method, Function<UriBuilder, URI> uri,
-                               Object body, ObjectReader reader) {
+                               ApiVersion version, Object body, ObjectReader reader) {
         // The interceptor belongs to this call, so even a failed connection retains the attempted request.
         var captured = new AtomicReference<HttpExchange.Request>();
         var request = client.mutate().requestInterceptor((outgoing, bytes, execution) -> {
@@ -80,6 +99,9 @@ public class SlotApiClient {
                     HttpExchange.visibleHeaders(outgoing.getHeaders()), new String(bytes, StandardCharsets.UTF_8)));
             return execution.execute(outgoing, bytes);
         }).build().method(method).uri(uri).accept(MediaType.APPLICATION_JSON, MediaType.APPLICATION_PROBLEM_JSON);
+        if (version != null) {
+            request.header(VERSION_HEADER, version.value());
+        }
         if (body != null) {
             request.contentType(MediaType.APPLICATION_JSON).body(body);
         }
@@ -154,6 +176,10 @@ public class SlotApiClient {
     }
 
     public record Result<T>(T value, HttpExchange exchange, String error) {
+        private <R> Result<R> map(Function<T, R> mapper) {
+            return new Result<>(succeeded() ? mapper.apply(value) : null, exchange, error);
+        }
+
         public boolean succeeded() {
             return error == null;
         }

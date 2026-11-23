@@ -7,6 +7,7 @@ import org.jooq.impl.DSL;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -17,6 +18,10 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultMatcher;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ObjectNode;
 import org.springframework.transaction.annotation.Transactional;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -62,6 +67,9 @@ class AppointmentSlotApiTest {
 
     @Autowired
     MockMvc mvc;
+
+    @Autowired
+    JsonMapper json;
 
     @Autowired
     DSLContext db;
@@ -120,6 +128,54 @@ class AppointmentSlotApiTest {
     }
 
     @Test
+    void comparesExactSlotContractsAcrossVersionsAndFilters() throws Exception {
+        String harbor = facilityId("Harbor Community Clinic").toString();
+        String cardiology = specialtyId("Cardiology").toString();
+        for (String query : List.of("", "?facilityId=" + harbor, "?specialtyId=" + cardiology,
+                "?facilityId=" + harbor + "&specialtyId=" + cardiology)) {
+            var legacy = readSlotJson(get(SLOTS + query));
+            assertThat(readSlotJson(get(SLOTS + query).header("API-Version", "1.0"))).isEqualTo(legacy);
+            var v2 = readSlotJson(get(SLOTS + query).header("API-Version", "2.0"));
+            assertThat(v2.size()).isEqualTo(legacy.size());
+            for (int i = 0; i < legacy.size(); i++) {
+                assertV2Slot((ObjectNode) v2.get(i), legacy.get(i));
+            }
+        }
+
+        for (String specialty : List.of("Cardiology", "General Medicine")) {
+            String path = SLOTS + "/" + slotId("Downtown General Hospital", specialty);
+            var legacy = readSlotJson(get(path));
+            assertThat(readSlotJson(get(path).header("API-Version", "1.0"))).isEqualTo(legacy);
+            assertV2Slot((ObjectNode) readSlotJson(get(path).header("API-Version", "2.0")), legacy);
+        }
+    }
+
+    private JsonNode readSlotJson(MockHttpServletRequestBuilder request) throws Exception {
+        return json.readTree(mvc.perform(request)
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_JSON))
+                .andExpect(header().string("Vary", "API-Version"))
+                .andReturn().getResponse().getContentAsString());
+    }
+
+    private void assertV2Slot(ObjectNode v2, JsonNode legacy) {
+        assertThat(legacy.propertyNames()).containsExactlyInAnyOrder("id", "facilityId", "facilityName",
+                "specialtyId", "specialtyName", "startsAt", "endsAt", "capacity", "activeBookings",
+                "remainingCapacity");
+        var flat = v2.deepCopy();
+        var availability = flat.remove("availability");
+        assertThat(availability.propertyNames())
+                .containsExactlyInAnyOrder("capacity", "activeBookings", "remainingCapacity", "status");
+        for (String field : List.of("capacity", "activeBookings", "remainingCapacity")) {
+            assertThat(flat.has(field)).isFalse();
+            flat.set(field, availability.required(field));
+        }
+        assertThat(availability.required("status").asString())
+                .isEqualTo(legacy.required("remainingCapacity").asInt() > 0 ? "AVAILABLE" : "FULL");
+        assertThat(flat).isEqualTo(legacy);
+    }
+
+    @Test
     void returnsEmptyCollectionForUnknownPositiveFilters() throws Exception {
         mvc.perform(get(SLOTS).param("facilityId", missingFacilityId().toString()))
                 .andExpect(status().isOk())
@@ -129,35 +185,43 @@ class AppointmentSlotApiTest {
                 .andExpect(jsonPath("$.length()").value(0));
     }
 
-    @Test
-    void returnsReferenceIdsAndNames() throws Exception {
-        mvc.perform(get("/api/facilities"))
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void returnsReferenceIdsAndNames(String version) throws Exception {
+        mvc.perform(versioned(get("/api/facilities"), version))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(2))
                 .andExpect(jsonPath("$[0].name").value("Downtown General Hospital"))
                 .andExpect(jsonPath("$[0].id").value(is(facilityId("Downtown General Hospital")), Long.class));
-        mvc.perform(get("/api/specialties"))
+        mvc.perform(versioned(get("/api/specialties"), version))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(2))
                 .andExpect(jsonPath("$[0].name").value("Cardiology"))
                 .andExpect(jsonPath("$[0].id").value(is(specialtyId("Cardiology")), Long.class));
     }
 
-    @Test
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
     @Transactional
-    void createsUpdatesAndDeletesAPersistedSlot() throws Exception {
+    void createsUpdatesAndDeletesAPersistedSlot(String version) throws Exception {
+        String availabilityPath = "2.0".equals(version) ? "$.availability" : "$";
+        int before = db.fetchCount(APPOINTMENT_SLOT);
         OffsetDateTime startsAt = OffsetDateTime.now().plusDays(14).withNano(0);
         Long facilityId = facilityId("Harbor Community Clinic");
         Long specialtyId = specialtyId("Cardiology");
-        String location = mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content("""
+        String location = mvc.perform(versioned(post(SLOTS), version).contentType(MediaType.APPLICATION_JSON).content("""
                         {"facilityId": %d, "specialtyId": %d, "startsAt": "%s", "endsAt": "%s", "capacity": 2}
                         """.formatted(facilityId, specialtyId, startsAt, startsAt.plusMinutes(30))))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").isNumber())
-                .andExpect(jsonPath("$.capacity").value(2))
-                .andExpectAll(availability("$", 0, 2))
+                .andExpect(jsonPath(availabilityPath + ".capacity").value(2))
+                .andExpectAll(availability(availabilityPath, 0, 2))
+                .andExpect(representation(version))
                 .andReturn().getResponse().getHeader("Location");
 
+        assertThat(db.fetchCount(APPOINTMENT_SLOT)).isEqualTo(before + 1);
         Long id = db.select(APPOINTMENT_SLOT.ID).from(APPOINTMENT_SLOT)
                 .where(APPOINTMENT_SLOT.STARTS_AT.eq(startsAt)).fetchSingle().value1();
         assertThat(location).isEqualTo(SLOTS + "/" + id);
@@ -165,10 +229,11 @@ class AppointmentSlotApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(is(id), Long.class))
                 .andExpect(jsonPath("$.capacity").value(2));
-        mvc.perform(patch(location).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}"))
+        mvc.perform(versioned(patch(location), version).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.capacity").value(3))
-                .andExpectAll(availability("$", 0, 3))
+                .andExpect(jsonPath(availabilityPath + ".capacity").value(3))
+                .andExpectAll(availability(availabilityPath, 0, 3))
+                .andExpect(representation(version))
                 .andExpect(jsonPath("$.facilityId").value(is(facilityId), Long.class))
                 .andExpect(jsonPath("$.specialtyId").value(is(specialtyId), Long.class));
         var updated = db.fetchSingle(APPOINTMENT_SLOT, APPOINTMENT_SLOT.ID.eq(id));
@@ -176,7 +241,7 @@ class AppointmentSlotApiTest {
         assertThat(updated.getStartsAt().toInstant()).isEqualTo(startsAt.toInstant());
         assertThat(updated.getEndsAt().toInstant()).isEqualTo(startsAt.plusMinutes(30).toInstant());
 
-        mvc.perform(delete(location)).andExpect(status().isNoContent()).andExpect(content().string(""));
+        mvc.perform(versioned(delete(location), version)).andExpect(status().isNoContent()).andExpect(content().string(""));
         mvc.perform(get(location)).andExpect(status().isNotFound());
         assertThat(db.fetchExists(APPOINTMENT_SLOT, APPOINTMENT_SLOT.ID.eq(id))).isFalse();
     }
@@ -196,27 +261,31 @@ class AppointmentSlotApiTest {
                 .andExpectAll(availability("$", active, 2 - active));
     }
 
-    @Test
-    void returnsNotFoundForMissingSlots() throws Exception {
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void returnsNotFoundForMissingSlots(String version) throws Exception {
         Long missing = db.select(max(APPOINTMENT_SLOT.ID))
                 .from(APPOINTMENT_SLOT).fetchSingle().value1() + 1;
         String path = SLOTS + "/" + missing;
 
         for (var request : List.of(get(path), delete(path),
                 patch(path).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}"))) {
-            problem(mvc.perform(request), 404, "Not Found", path)
+            problem(mvc.perform(versioned(request, version)), 404, "Not Found", path)
                     .andExpect(jsonPath("$.detail").value("Slot with id " + missing + " not found"));
         }
     }
 
-    @Test
-    void refusesToReduceCapacityBelowActiveBookingsOrDeleteABookedSlot() throws Exception {
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void refusesToReduceCapacityBelowActiveBookingsOrDeleteABookedSlot(String version) throws Exception {
         Long booked = slotId("Harbor Community Clinic", "Cardiology");
         String path = SLOTS + "/" + booked;
-        problem(mvc.perform(patch(path).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":1}")),
+        problem(mvc.perform(versioned(patch(path), version).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":1}")),
                 409, "Conflict", path)
                 .andExpect(jsonPath("$.detail").value("Cannot set capacity below the 2 active bookings."));
-        problem(mvc.perform(delete(path)), 409, "Conflict", path)
+        problem(mvc.perform(versioned(delete(path), version)), 409, "Conflict", path)
                 .andExpect(jsonPath("$.detail").value("Cannot delete a slot with active bookings."));
         assertThat(db.fetchSingle(APPOINTMENT_SLOT, APPOINTMENT_SLOT.ID.eq(booked)).getCapacity()).isEqualTo(3);
         assertThat(db.fetchCount(BOOKING, BOOKING.APPOINTMENT_SLOT_ID.eq(booked))).isEqualTo(2);
@@ -289,11 +358,13 @@ class AppointmentSlotApiTest {
     void rejectsInvalidCreationWithoutPersistingASlot(String invalidField) throws Exception {
         var request = invalidSlotRequest(invalidField);
         int before = db.fetchCount(APPOINTMENT_SLOT);
-        mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content("""
-                        {"facilityId": %d, "specialtyId": %d, "startsAt": "%s", "endsAt": "%s", "capacity": %d}
-                        """.formatted(request.facilityId(), request.specialtyId(), request.startsAt(),
-                        request.endsAt(), request.capacity())))
-                .andExpect(status().isBadRequest());
+        for (String version : List.of("1.0", "2.0")) {
+            mvc.perform(versioned(post(SLOTS), version).contentType(MediaType.APPLICATION_JSON).content("""
+                            {"facilityId": %d, "specialtyId": %d, "startsAt": "%s", "endsAt": "%s", "capacity": %d}
+                            """.formatted(request.facilityId(), request.specialtyId(), request.startsAt(),
+                            request.endsAt(), request.capacity())))
+                    .andExpect(status().isBadRequest());
+        }
         assertThat(db.fetchCount(APPOINTMENT_SLOT)).isEqualTo(before);
     }
 
@@ -308,6 +379,23 @@ class AppointmentSlotApiTest {
                 .rootCause().isInstanceOfSatisfying(SQLException.class,
                         cause -> assertThat(cause.getSQLState()).isEqualTo(sqlState));
         assertThat(db.fetchCount(APPOINTMENT_SLOT)).isEqualTo(before);
+    }
+
+    private MockHttpServletRequestBuilder versioned(MockHttpServletRequestBuilder request, String version) {
+        return version == null ? request : request.header("API-Version", version);
+    }
+
+    private ResultMatcher representation(String version) {
+        return result -> {
+            if ("2.0".equals(version)) {
+                jsonPath("$.availability.status").value("AVAILABLE").match(result);
+                for (String field : List.of("capacity", "activeBookings", "remainingCapacity")) {
+                    jsonPath("$." + field).doesNotExist().match(result);
+                }
+            } else {
+                jsonPath("$.availability").doesNotExist().match(result);
+            }
+        };
     }
 
     private SlotRequest invalidSlotRequest(String invalidField) {

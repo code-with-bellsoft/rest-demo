@@ -12,11 +12,13 @@ import com.vaadin.flow.component.html.H2;
 import com.vaadin.flow.component.html.Paragraph;
 import com.vaadin.flow.component.notification.Notification;
 import com.vaadin.flow.component.notification.NotificationVariant;
+import com.vaadin.flow.component.select.Select;
 import com.vaadin.flow.component.textfield.IntegerField;
 import com.vaadin.flow.router.AfterNavigationEvent;
 import com.vaadin.flow.router.AfterNavigationObserver;
 import com.vaadin.flow.router.PageTitle;
 import com.vaadin.flow.router.Route;
+import dev.cyberjar.medflow.ui.client.ApiVersion;
 import dev.cyberjar.medflow.ui.client.SlotApiClient;
 import dev.cyberjar.medflow.ui.client.SlotApiClient.Result;
 import dev.cyberjar.medflow.ui.dto.ReferenceDto;
@@ -39,6 +41,7 @@ public class SlotView extends Div implements AfterNavigationObserver {
     private final Grid<SlotDto> grid = new Grid<>();
     private final ComboBox<ReferenceDto> facility = SlotForm.referenceBox("Facility");
     private final ComboBox<ReferenceDto> specialty = SlotForm.referenceBox("Specialty");
+    private final Select<ApiVersion> version = new Select<>();
     private final Paragraph status = new Paragraph();
     private List<ReferenceDto> facilities;
     private List<ReferenceDto> specialties;
@@ -68,7 +71,12 @@ public class SlotView extends Div implements AfterNavigationObserver {
         actions.addClassName("slot-actions");
         var tableHeading = new Div(new H2("Appointment slots"), actions);
         tableHeading.addClassName("table-heading");
-        var filters = new Div(facility, specialty, new Button("Clear filters", event -> clearFilters()),
+        version.setLabel("API version");
+        version.setItems(ApiVersion.values());
+        version.setItemLabelGenerator(item -> "Version " + item.value());
+        version.setValue(ApiVersion.V1);
+        version.addValueChangeListener(event -> loadSlots(true));
+        var filters = new Div(facility, specialty, version, new Button("Clear filters", event -> clearFilters()),
                 new Button("Refresh", event -> refresh()));
         filters.addClassName("slot-filters");
         facility.addValueChangeListener(event -> filterChanged());
@@ -130,7 +138,7 @@ public class SlotView extends Div implements AfterNavigationObserver {
     }
 
     private Result<List<SlotDto>> loadSlots(boolean showExchange) {
-        var result = api.slots(SlotForm.id(facility), SlotForm.id(specialty));
+        var result = api.slots(version.getValue(), SlotForm.id(facility), SlotForm.id(specialty));
         if (showExchange) {
             inspector.show(result.exchange());
         }
@@ -167,7 +175,8 @@ public class SlotView extends Div implements AfterNavigationObserver {
             reportFailure(failure);
             return;
         }
-        new SlotForm(facilities, specialties, request -> finish(api.create(request), "Slot created.")).open();
+        new SlotForm(facilities, specialties,
+                request -> finish(api.create(version.getValue(), request), "Slot created.")).open();
     }
 
     private void openEdit(SlotDto slot) {
@@ -177,7 +186,8 @@ public class SlotView extends Div implements AfterNavigationObserver {
         capacity.setValue(slot.capacity());
         dialog.add(capacity);
         var save = new Button("Save capacity", event -> {
-            if (finish(api.updateCapacity(slot.id(), new UpdateCapacityRequest(capacity.getValue())),
+            if (finish(api.updateCapacity(version.getValue(), slot.id(),
+                    new UpdateCapacityRequest(capacity.getValue())),
                     "Capacity updated.")) {
                 dialog.close();
             }
@@ -194,7 +204,7 @@ public class SlotView extends Div implements AfterNavigationObserver {
         dialog.setCancelable(true);
         dialog.setConfirmText("Delete slot");
         dialog.setConfirmButtonTheme("danger primary");
-        dialog.addConfirmListener(event -> finish(api.delete(slot.id()), "Slot deleted."));
+        dialog.addConfirmListener(event -> finish(api.delete(version.getValue(), slot.id()), "Slot deleted."));
         dialog.open();
     }
 

@@ -55,7 +55,92 @@ The collection accepts optional `facilityId` and `specialtyId` query parameters.
 
 [requests.http](requests.http) contains optional examples for the JetBrains HTTP Client.
 
-Slot responses include `activeBookings` and `remainingCapacity`. Remaining capacity is total capacity minus the count of reserved and confirmed bookings. The grid displays these API values as Capacity, Booked, and Remaining. Follow the `Location` header after creating a slot to retrieve it.
+Slot responses report `activeBookings` and `remainingCapacity`. Remaining capacity is total capacity minus the count of reserved and confirmed bookings. The grid displays these API values as Capacity, Booked, and Remaining. Follow the `Location` header after creating a slot to retrieve it.
+
+## API Versioning
+
+API versioning is a compatibility strategy. It gives clients time to adopt a breaking change on their own schedule. For example, a client that ignores unfamiliar properties can usually handle a new optional response field. Moving a required field changes the path a client reads. In this demo, clients that look for `slot.capacity` need to read `slot.availability.capacity` in v2.
+
+Spring Boot configures Spring Framework 7's native MVC version resolution with `spring.mvc.apiversion.use.header`, `spring.mvc.apiversion.default`, and `spring.mvc.apiversion.supported`. Spring resolves the `API-Version` request header, parses and validates the version, and selects a handler using the mapping annotation's `version` attribute. The header keeps the existing resource URLs and `Location` values usable across versions. Requests with no header default to v1, so existing clients can keep using their original JSON contract. Use `1.0` and `2.0` in client requests. Spring's semantic parser determines which inputs are valid. In Spring Framework 7.0.9 it ignores leading non-digit characters and treats omitted minor or patch components as zero. For example, `v2.0`, `-2.0`, `2`, and `2.0.0` all select v2. Versions that Spring cannot parse or that resolve to an unsupported version receive a 400 Problem Details response. [Spring MVC API versioning](https://docs.spring.io/spring-framework/reference/web/webmvc-versioning.html)
+
+GET collection, GET by ID, POST, and PATCH return the selected representation. Both sets of mappings call the same service and jOOQ repository, with the same validation, bookings, transactions, and database. POST and PATCH accept the original request bodies. DELETE and the facility and specialty endpoints have one unversioned mapping each. Slot GET responses include `Vary: API-Version`, so a cache can distinguish versions of the same URL, including requests with no header.
+
+**Version 1.0**
+
+```json
+{
+  "id": 42,
+  "facilityId": 1,
+  "facilityName": "Harbor Community Clinic",
+  "specialtyId": 2,
+  "specialtyName": "Cardiology",
+  "startsAt": "2027-01-15T09:00:00Z",
+  "endsAt": "2027-01-15T09:30:00Z",
+  "capacity": 3,
+  "activeBookings": 2,
+  "remainingCapacity": 1
+}
+```
+
+**Version 2.0**
+
+```json
+{
+  "id": 42,
+  "facilityId": 1,
+  "facilityName": "Harbor Community Clinic",
+  "specialtyId": 2,
+  "specialtyName": "Cardiology",
+  "startsAt": "2027-01-15T09:00:00Z",
+  "endsAt": "2027-01-15T09:30:00Z",
+  "availability": {
+    "capacity": 3,
+    "activeBookings": 2,
+    "remainingCapacity": 1,
+    "status": "AVAILABLE"
+  }
+}
+```
+
+IDs and capacity counts are JSON integers. Names and timestamps are strings. The timestamps keep their existing ISO 8601 offset format. In v2, all three counts live exclusively inside `availability`. The `status` is `AVAILABLE` when remaining capacity is positive and `FULL` when it is zero.
+
+```bash
+curl -i http://localhost:8080/api/slots
+
+curl -i -H 'API-Version: 1.0' http://localhost:8080/api/slots
+
+curl -i -H 'API-Version: 2.0' http://localhost:8080/api/slots
+
+curl -i -H 'API-Version: 99.0' http://localhost:8080/api/slots
+```
+
+With the demo running, these Bash commands discover reference IDs, create a temporary slot in v1, update it in v2, and remove it. They use jq and Python 3.
+
+```bash
+base=http://localhost:8080
+facility=$(curl -fsS "$base/api/facilities" | jq -er '.[0].id')
+specialty=$(curl -fsS "$base/api/specialties" | jq -er '.[0].id')
+payload=$(python3 - "$facility" "$specialty" <<'PYTHON'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+start = datetime.now(timezone.utc) + timedelta(days=7)
+print(json.dumps(dict(facilityId=int(sys.argv[1]), specialtyId=int(sys.argv[2]), capacity=2,
+                      startsAt=start.isoformat(), endsAt=(start + timedelta(minutes=30)).isoformat())))
+PYTHON
+)
+id=$(curl -fsS -H 'API-Version: 1.0' -H 'Content-Type: application/json' \
+  --data "$payload" "$base/api/slots" | jq -er '.id')
+
+curl -i -X PATCH -H 'API-Version: 2.0' -H 'Content-Type: application/json' \
+  --data '{"capacity":3}' "$base/api/slots/$id"
+
+curl -i -X DELETE -H 'API-Version: 2.0' "$base/api/slots/$id"
+```
+
+The Vaadin **API version** selector starts at **Version 1.0**. Switching it reloads the grid with the current filters. The client reads the selected contract and displays the same columns. The HTTP inspector shows the outgoing version header and the response JSON captured from the API. After a create or capacity update, the inspector keeps that exchange visible while the grid refreshes.
+
+After building the API JAR with Maven, run `./scripts/verify-versioning.sh`. It uses Bash, curl, jq, Python 3, Java, and Docker to verify both contracts and the shared booking rules against a disposable PostgreSQL database and API.
 
 ## Validation
 

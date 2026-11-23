@@ -2,6 +2,7 @@ package dev.cyberjar.medflow.slot;
 
 import dev.cyberjar.medflow.reference.ReferenceDataRepository;
 import dev.cyberjar.medflow.slot.dto.SlotRequest;
+import dev.cyberjar.medflow.slot.dto.SlotResponse;
 import dev.cyberjar.medflow.slot.validation.EndAfterStart;
 import dev.cyberjar.medflow.slot.validation.ExistingFacility;
 import dev.cyberjar.medflow.slot.validation.ExistingSpecialty;
@@ -13,6 +14,7 @@ import jakarta.validation.constraints.Positive;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
@@ -24,12 +26,14 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -64,6 +68,60 @@ class AppointmentSlotValidationTest {
 
     private final OffsetDateTime start = OffsetDateTime.now(ZoneOffset.UTC).plusDays(2);
     private final OffsetDateTime end = start.plusMinutes(30);
+
+    @ParameterizedTest
+    @ValueSource(strings = {"99.0", "malformed", "1.0.0.0", "999999999999999.0", "<untrusted>"})
+    void rejectsInvalidVersionsWithSafeProblemDetails(String version) throws Exception {
+        problem(mvc.perform(get(SLOTS).header("API-Version", version).accept(MediaType.APPLICATION_PROBLEM_JSON)),
+                400, "Bad Request", SLOTS)
+                .andExpect(jsonPath("$.detail").value("Invalid API version. Supported versions are 1.0 and 2.0."))
+                .andExpect(content().string(not(containsString(version))));
+        verifyNoInteractions(service, references);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"v2.0", "-2.0", "garbage2.0", "2", "2.0.0"})
+    void usesSpringSemanticVersionParsing(String version) throws Exception {
+        when(service.findSlotById(1L)).thenReturn(
+                new SlotResponse(1L, FACILITY, "Harbor", SPECIALTY, "Cardiology", start, end, 2, 0, 2));
+
+        mvc.perform(get(SLOTS + "/1").header("API-Version", version))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.availability.capacity").value(2))
+                .andExpect(jsonPath("$.capacity").doesNotExist());
+    }
+
+    @Test
+    void doesNotReportInconsistentAvailabilityAsFull() throws Exception {
+        when(service.findSlotById(1L)).thenReturn(
+                new SlotResponse(1L, FACILITY, "Harbor", SPECIALTY, "Cardiology", start, end, 2, 3, -1));
+        String path = SLOTS + "/1";
+        mvc.perform(get(path)).andExpect(status().isOk()).andExpect(jsonPath("$.remainingCapacity").value(-1));
+        problem(mvc.perform(get(path).header("API-Version", "2.0")), 500, "Internal Server Error", path)
+                .andExpect(jsonPath("$.detail").value("The server could not complete the request"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1.0", "2.0"})
+    void callsServiceExactlyOncePerVersionedWrite(String version) throws Exception {
+        when(references.existsFacilityById(FACILITY)).thenReturn(true);
+        when(references.existsSpecialtyById(SPECIALTY)).thenReturn(true);
+        var created = new SlotResponse(1L, FACILITY, "Harbor", SPECIALTY, "Cardiology", start, end, 2, 0, 2);
+        var updated = new SlotResponse(1L, FACILITY, "Harbor", SPECIALTY, "Cardiology", start, end, 3, 0, 3);
+        when(service.createSlot(any())).thenReturn(created);
+        when(service.updateSlot(1L, 3)).thenReturn(updated);
+
+        mvc.perform(post(SLOTS).header("API-Version", version)
+                        .contentType(MediaType.APPLICATION_JSON).content(validBody().toString()))
+                .andExpect(status().isCreated());
+        mvc.perform(patch(SLOTS + "/1").header("API-Version", version)
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}"))
+                .andExpect(status().isOk());
+
+        verify(service).createSlot(any());
+        verify(service).updateSlot(1L, 3);
+        verifyNoMoreInteractions(service);
+    }
 
     @ParameterizedTest
     @CsvSource({
@@ -111,18 +169,22 @@ class AppointmentSlotValidationTest {
                                 .isEqualTo(Future.class));
     }
 
-    @Test
-    void rejectsUnknownFacilityBeforeCallingService() throws Exception {
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void rejectsUnknownFacilityBeforeCallingService(String version) throws Exception {
         when(references.existsSpecialtyById(SPECIALTY)).thenReturn(true);
-        validationError(rejectsCreation(validBody().put("facilityId", UNKNOWN)),
+        validationError(rejectsCreation(validBody().put("facilityId", UNKNOWN), version),
                 "facilityId", "Facility does not exist");
         verify(references).existsFacilityById(UNKNOWN);
     }
 
-    @Test
-    void rejectsUnknownSpecialtyBeforeCallingService() throws Exception {
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void rejectsUnknownSpecialtyBeforeCallingService(String version) throws Exception {
         when(references.existsFacilityById(FACILITY)).thenReturn(true);
-        validationError(rejectsCreation(validBody().put("specialtyId", UNKNOWN)),
+        validationError(rejectsCreation(validBody().put("specialtyId", UNKNOWN), version),
                 "specialtyId", "Specialty does not exist");
         verify(references).existsSpecialtyById(UNKNOWN);
     }
@@ -194,12 +256,14 @@ class AppointmentSlotValidationTest {
     @ParameterizedTest
     @ValueSource(strings = {"0", "-1", "abc"})
     void rejectsInvalidPathIdsForAllSlotOperations(String id) throws Exception {
-        for (var method : new HttpMethod[]{HttpMethod.GET, HttpMethod.PATCH, HttpMethod.DELETE}) {
-            var request = request(method, SLOTS + "/{id}", id);
-            if (method.equals(HttpMethod.PATCH)) {
-                request.contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}");
+        for (String version : Arrays.asList(null, "1.0", "2.0")) {
+            for (var method : List.of(HttpMethod.GET, HttpMethod.PATCH, HttpMethod.DELETE)) {
+                var request = versioned(request(method, SLOTS + "/{id}", id), version);
+                if (method.equals(HttpMethod.PATCH)) {
+                    request.contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}");
+                }
+                parameterError(mvc.perform(request), SLOTS + "/" + id, "id", id);
             }
-            parameterError(mvc.perform(request), SLOTS + "/" + id, "id", id);
         }
         verifyNoInteractions(service);
     }
@@ -208,6 +272,10 @@ class AppointmentSlotValidationTest {
     @CsvSource({"facilityId, 0", "specialtyId, -1", "facilityId, abc"})
     void rejectsInvalidFilters(String name, String value) throws Exception {
         parameterError(mvc.perform(get(SLOTS).param(name, value)), SLOTS, name, value);
+        for (String version : List.of("1.0", "2.0")) {
+            parameterError(mvc.perform(get(SLOTS).header("API-Version", version).param(name, value)),
+                    SLOTS, name, value);
+        }
         verifyNoInteractions(service, references);
     }
 
@@ -215,13 +283,15 @@ class AppointmentSlotValidationTest {
     @ValueSource(strings = {"{\"capacity\":0}", "{\"capacity\":-1}", "{\"capacity\":null}",
             "{}", "{\"capacity\":\"abc\"}"})
     void rejectsInvalidCapacityUpdates(String body) throws Exception {
-        var result = problem(mvc.perform(patch(SLOTS + "/1").contentType(MediaType.APPLICATION_JSON)
-                .content(body)), 400, "Bad Request", SLOTS + "/1");
-        if (body.contains("abc")) {
-            unreadableBody(result);
-        } else {
-            validationError(result, "capacity", body.equals("{}") || body.contains("null")
-                    ? "must not be null" : "must be greater than 0");
+        for (String version : Arrays.asList(null, "1.0", "2.0")) {
+            var result = problem(mvc.perform(versioned(patch(SLOTS + "/1"), version)
+                    .contentType(MediaType.APPLICATION_JSON).content(body)), 400, "Bad Request", SLOTS + "/1");
+            if (body.contains("abc")) {
+                unreadableBody(result);
+            } else {
+                validationError(result, "capacity", body.equals("{}") || body.contains("null")
+                        ? "must not be null" : "must be greater than 0");
+            }
         }
         verifyNoInteractions(service);
     }
@@ -229,35 +299,41 @@ class AppointmentSlotValidationTest {
     @ParameterizedTest
     @ValueSource(strings = {"", "{"})
     void rejectsMissingBodyOrMalformedJson(String body) throws Exception {
-        unreadableBody(problem(mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content(body)),
-                400, "Bad Request", SLOTS));
+        for (String version : Arrays.asList(null, "1.0", "2.0")) {
+            unreadableBody(problem(mvc.perform(versioned(post(SLOTS), version)
+                    .contentType(MediaType.APPLICATION_JSON).content(body)), 400, "Bad Request", SLOTS));
+        }
         verifyNoInteractions(service, references);
     }
 
-    @Test
-    void preservesHttpProtocolErrorsAndHeaders() throws Exception {
-        problem(mvc.perform(put(SLOTS)), 405, "Method Not Allowed", SLOTS)
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void preservesHttpProtocolErrorsAndHeaders(String version) throws Exception {
+        problem(mvc.perform(versioned(put(SLOTS), version)), 405, "Method Not Allowed", SLOTS)
                 .andExpect(header().string(HttpHeaders.ALLOW, allOf(containsString("GET"), containsString("POST"))));
-        problem(mvc.perform(post(SLOTS).contentType(MediaType.TEXT_PLAIN).content("{}")),
+        problem(mvc.perform(versioned(post(SLOTS), version).contentType(MediaType.TEXT_PLAIN).content("{}")),
                 415, "Unsupported Media Type", SLOTS)
                 .andExpect(header().string(HttpHeaders.ACCEPT, containsString("application/json")));
         when(service.findSlots(null, null)).thenReturn(List.of());
-        mvc.perform(get(SLOTS).accept(MediaType.IMAGE_PNG))
+        mvc.perform(versioned(get(SLOTS), version).accept(MediaType.IMAGE_PNG))
                 .andExpect(status().isNotAcceptable())
                 .andExpect(header().doesNotExist(HttpHeaders.CONTENT_TYPE))
                 .andExpect(content().string(""));
         when(service.findSlots(null, null)).thenAnswer(invocation -> {
             throw new HttpMediaTypeNotAcceptableException(List.of(MediaType.APPLICATION_JSON));
         });
-        problem(mvc.perform(get(SLOTS).accept(MediaType.APPLICATION_PROBLEM_JSON)), 406, "Not Acceptable", SLOTS)
+        problem(mvc.perform(versioned(get(SLOTS), version).accept(MediaType.APPLICATION_PROBLEM_JSON)), 406, "Not Acceptable", SLOTS)
                 .andExpect(header().string(HttpHeaders.ACCEPT, "application/json"));
     }
 
-    @Test
-    void returnsSafeProblemForUnexpectedDatabaseFailures() throws Exception {
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"1.0", "2.0"})
+    void returnsSafeProblemForUnexpectedDatabaseFailures(String version) throws Exception {
         String internal = "SELECT secret FROM internal_table with password: demo-secret";
         when(service.findSlots(null, null)).thenThrow(new DataIntegrityViolationException(internal));
-        problem(mvc.perform(get(SLOTS)), 500, "Internal Server Error", SLOTS)
+        problem(mvc.perform(versioned(get(SLOTS), version)), 500, "Internal Server Error", SLOTS)
                 .andExpect(jsonPath("$.detail").value("The server could not complete the request"))
                 .andExpect(jsonPath("$.errors").doesNotExist())
                 .andExpect(jsonPath("$.trace").doesNotExist())
@@ -302,9 +378,18 @@ class AppointmentSlotValidationTest {
     }
 
     private ResultActions rejectsCreation(ObjectNode body) throws Exception {
-        var result = problem(mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content(body.toString())),
+        return rejectsCreation(body, null);
+    }
+
+    private ResultActions rejectsCreation(ObjectNode body, String version) throws Exception {
+        var result = problem(mvc.perform(versioned(post(SLOTS), version)
+                        .contentType(MediaType.APPLICATION_JSON).content(body.toString())),
                 400, "Bad Request", SLOTS);
         verifyNoInteractions(service);
         return result;
+    }
+
+    private MockHttpServletRequestBuilder versioned(MockHttpServletRequestBuilder request, String version) {
+        return version == null ? request : request.header("API-Version", version);
     }
 }
