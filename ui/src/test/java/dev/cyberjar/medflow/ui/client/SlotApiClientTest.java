@@ -4,8 +4,10 @@ import com.sun.net.httpserver.HttpServer;
 import com.vaadin.flow.component.Component;
 import com.vaadin.flow.component.UI;
 import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.dialog.Dialog;
 import com.vaadin.flow.component.grid.Grid;
 import com.vaadin.flow.component.html.Pre;
+import com.vaadin.flow.component.textfield.IntegerField;
 import com.vaadin.flow.server.VaadinSession;
 import com.vaadin.flow.dom.Element;
 import dev.cyberjar.medflow.ui.dto.CreateSlotRequest;
@@ -210,7 +212,7 @@ class SlotApiClientTest {
     }
 
     @Test
-    void vaadinViewLoadsAndRefreshesThroughHttpAndDisplaysTheOutage() {
+    void vaadinViewKeepsTheWriteInTheInspectorAfterRefreshingTheGrid() {
         replies.add(Reply.json(200, FACILITIES));
         replies.add(Reply.json(200, SPECIALTIES));
         replies.add(Reply.json(200, "[" + SLOT + "]"));
@@ -237,6 +239,27 @@ class SlotApiClientTest {
             assertThat(descendants(view, Pre.class).map(Pre::getText))
                     .anyMatch(text -> text.startsWith("200 OK") && text.contains("Cardiology")
                             && text.contains("\"activeBookings\" : 2") && text.contains("\"remainingCapacity\" : 0"));
+
+            String updatedSlot = SLOT.replace("\"capacity\":2", "\"capacity\":3")
+                    .replace("\"remainingCapacity\":0", "\"remainingCapacity\":1");
+            replies.add(Reply.json(200, updatedSlot));
+            replies.add(Reply.json(200, "[" + updatedSlot + "]"));
+            descendants(view, Button.class).filter(button -> button.getText().equals("Edit capacity"))
+                    .findFirst().orElseThrow().click();
+            ui.getInternals().getStateTree().runExecutionsBeforeClientResponse();
+            var dialog = descendants(ui, Dialog.class).findFirst().orElseThrow();
+            descendants(dialog, IntegerField.class).findFirst().orElseThrow().setValue(3);
+            dialog.getFooter().getElement().getChildren().flatMap(element -> element.getComponent().stream())
+                    .filter(Button.class::isInstance).map(Button.class::cast)
+                    .filter(button -> button.getText().equals("Save capacity"))
+                    .findFirst().orElseThrow().click();
+
+            assertThat(requests).extracting(SeenRequest::method)
+                    .containsExactly("GET", "GET", "GET", "PATCH", "GET");
+            assertThat(grid.getGenericDataView().getItems()).singleElement()
+                    .satisfies(updated -> assertThat(updated.capacity()).isEqualTo(3));
+            assertThat(descendants(view, Pre.class).map(Pre::getText)).anyMatch(text ->
+                    text.startsWith("PATCH ") && text.contains("/api/slots/42"));
 
             server.stop(0);
             descendants(view, Button.class).filter(button -> button.getText().equals("Refresh"))

@@ -71,6 +71,8 @@ Run the smoke test against the running API with the seed fixtures present. It re
 ./scripts/validation-smoke.sh
 ```
 
+Run `./verify-medflow-validation.sh` for the full build and live API and SQL checks. It starts a disposable PostgreSQL container and a separate API on local ports selected at runtime. To run only the live HTTP checks against an existing demo API, use `RUN_MAVEN=0 CHECK_DB=0 API_BASE=http://localhost:8080 ./verify-medflow-validation.sh`.
+
 ## Fixtures
 
 | Facility | Specialty | Capacity | Bookings |

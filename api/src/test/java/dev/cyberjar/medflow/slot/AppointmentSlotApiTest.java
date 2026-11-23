@@ -3,6 +3,7 @@ package dev.cyberjar.medflow.slot;
 import dev.cyberjar.medflow.enums.BookingStatus;
 import dev.cyberjar.medflow.slot.dto.SlotRequest;
 import org.jooq.DSLContext;
+import org.jooq.impl.DSL;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -23,6 +24,8 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static dev.cyberjar.medflow.Tables.APPOINTMENT_SLOT;
 import static dev.cyberjar.medflow.Tables.BOOKING;
@@ -31,6 +34,7 @@ import static dev.cyberjar.medflow.Tables.SPECIALTY;
 import static dev.cyberjar.medflow.enums.BookingStatus.CANCELLED;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.is;
 import static org.jooq.impl.DSL.max;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -211,6 +215,42 @@ class AppointmentSlotApiTest {
         mvc.perform(delete(path)).andExpect(status().isConflict());
         assertThat(db.fetchSingle(APPOINTMENT_SLOT, APPOINTMENT_SLOT.ID.eq(booked)).getCapacity()).isEqualTo(3);
         assertThat(db.fetchCount(BOOKING, BOOKING.APPOINTMENT_SLOT_ID.eq(booked))).isEqualTo(2);
+    }
+
+    @Test
+    void capacityUpdateWaitsForTheSlotLockAndCountsTheCommittedBookings() throws Exception {
+        var start = OffsetDateTime.now().plusDays(14);
+        Long id = repository.createSlot(new SlotRequest(
+                facilityId("Harbor Community Clinic"), specialtyId("Cardiology"),
+                start, start.plusMinutes(30), 3)).id();
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var update = db.transactionResult(configuration -> {
+                DSLContext holder = DSL.using(configuration);
+                int holderPid = holder.fetchOne("select pg_backend_pid()").get(0, Integer.class);
+                holder.select(APPOINTMENT_SLOT.ID).from(APPOINTMENT_SLOT)
+                        .where(APPOINTMENT_SLOT.ID.eq(id)).forUpdate().fetchSingle();
+                var competingUpdate = executor.submit(() ->
+                        mvc.perform(patch(SLOTS + "/{id}", id).contentType(MediaType.APPLICATION_JSON)
+                                        .content("{\"capacity\":1}"))
+                                .andReturn().getResponse().getStatus());
+                await().atMost(5, TimeUnit.SECONDS).until(() ->
+                        db.fetchOne("""
+                                select exists (
+                                    select 1 from pg_locks
+                                    where not granted and ? = any(pg_blocking_pids(pid))
+                                )
+                                """, holderPid).get(0, Boolean.class));
+                holder.insertInto(BOOKING, BOOKING.APPOINTMENT_SLOT_ID, BOOKING.STATUS)
+                        .values(id, BookingStatus.RESERVED)
+                        .values(id, BookingStatus.CONFIRMED)
+                        .execute();
+                return competingUpdate;
+            });
+            assertThat(update.get(5, TimeUnit.SECONDS)).isEqualTo(409);
+            assertThat(repository.findSlotById(id).orElseThrow().capacity()).isEqualTo(3);
+        } finally {
+            db.deleteFrom(APPOINTMENT_SLOT).where(APPOINTMENT_SLOT.ID.eq(id)).execute();
+        }
     }
 
     @Test

@@ -35,7 +35,7 @@ public class AppointmentSlotRepository {
     }
 
     public List<SlotResponse> findSlots(Long facilityId, Long specialtyId) {
-        return selectSlots(db)
+        return selectSlots(db, noCondition())
                 .where(facilityId == null ? noCondition() : APPOINTMENT_SLOT.FACILITY_ID.eq(facilityId))
                 .and(specialtyId == null ? noCondition() : APPOINTMENT_SLOT.SPECIALTY_ID.eq(specialtyId))
                 .orderBy(APPOINTMENT_SLOT.STARTS_AT, APPOINTMENT_SLOT.ID)
@@ -43,7 +43,7 @@ public class AppointmentSlotRepository {
     }
 
     public Optional<SlotResponse> findSlotById(Long id) {
-        return selectSlots(db)
+        return selectSlots(db, BOOKING.APPOINTMENT_SLOT_ID.eq(id))
                 .where(APPOINTMENT_SLOT.ID.eq(id))
                 .fetchOptional(this::toResponse);
     }
@@ -60,7 +60,8 @@ public class AppointmentSlotRepository {
                     .returningResult(APPOINTMENT_SLOT.ID)
                     .fetchSingle()
                     .value1();
-            return selectSlots(ctx).where(APPOINTMENT_SLOT.ID.eq(id)).fetchSingle(this::toResponse);
+            return selectSlots(ctx, BOOKING.APPOINTMENT_SLOT_ID.eq(id))
+                    .where(APPOINTMENT_SLOT.ID.eq(id)).fetchSingle(this::toResponse);
         });
     }
 
@@ -80,7 +81,8 @@ public class AppointmentSlotRepository {
                     .set(APPOINTMENT_SLOT.CAPACITY, newCapacity)
                     .where(APPOINTMENT_SLOT.ID.eq(id))
                     .execute();
-            return Optional.of(selectSlots(ctx).where(APPOINTMENT_SLOT.ID.eq(id)).fetchSingle(this::toResponse));
+            return Optional.of(selectSlots(ctx, BOOKING.APPOINTMENT_SLOT_ID.eq(id))
+                    .where(APPOINTMENT_SLOT.ID.eq(id)).fetchSingle(this::toResponse));
         });
     }
 
@@ -91,7 +93,7 @@ public class AppointmentSlotRepository {
                 return false;
             }
 
-            if (countActiveBookings(ctx, id) > 0) {
+            if (ctx.fetchExists(BOOKING, BOOKING.APPOINTMENT_SLOT_ID.eq(id).and(activeBooking()))) {
                 throw new SlotConflictException("Cannot delete a slot with active bookings.");
             }
 
@@ -120,10 +122,11 @@ public class AppointmentSlotRepository {
         return BOOKING.STATUS.in(BookingStatus.RESERVED, BookingStatus.CONFIRMED);
     }
 
-    private SelectOnConditionStep<?> selectSlots(DSLContext ctx) {
+    private SelectOnConditionStep<?> selectSlots(DSLContext ctx, Condition bookingScope) {
         var bookingCounts = ctx.select(BOOKING.APPOINTMENT_SLOT_ID, ACTIVE_BOOKINGS)
                 .from(BOOKING)
                 .where(activeBooking())
+                .and(bookingScope)
                 .groupBy(BOOKING.APPOINTMENT_SLOT_ID)
                 .asTable("booking_counts");
         return ctx.select(APPOINTMENT_SLOT.ID, APPOINTMENT_SLOT.FACILITY_ID, FACILITY.NAME,

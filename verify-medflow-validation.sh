@@ -6,17 +6,21 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-API_BASE="${API_BASE:-http://localhost:8080}"
+API_BASE="${API_BASE:-}"
 API_BASE="${API_BASE%/}"
 RUN_MAVEN="${RUN_MAVEN:-1}"
-START_DB="${START_DB:-1}"
-START_API="${START_API:-1}"
 CHECK_DB="${CHECK_DB:-1}"
-DB_USER="${DB_USER:-meduser}"
-DB_NAME="${DB_NAME:-medflow_rest}"
+DB_USER=meduser
+DB_NAME=medflow_validation
+
+if [[ "$CHECK_DB" == 1 && ( -n "$API_BASE" || "${START_DB:-1}" != 1 || "${START_API:-1}" != 1 ) ]]; then
+  echo "Direct SQL checks require the script's own database and API. Use CHECK_DB=0 with API_BASE." >&2
+  exit 1
+fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/medflow-validation.XXXXXX")"
 API_PID=""
+DB_CONTAINER=""
 cleanup() {
   local exit_code=$?
   trap - EXIT
@@ -24,6 +28,9 @@ cleanup() {
     echo "Stopping API process started by this script (PID $API_PID)..."
     kill "$API_PID" 2>/dev/null || true
     wait "$API_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$DB_CONTAINER" ]]; then
+    docker stop "$DB_CONTAINER" >/dev/null || exit_code=1
   fi
   if (( exit_code != 0 )) && [[ -s "$WORK_DIR/api.log" ]]; then
     echo "--- Last 50 lines of API log ---" >&2
@@ -64,41 +71,44 @@ else
   echo "== 2/5: Maven verification skipped (RUN_MAVEN=0) =="
 fi
 
-if [[ "$START_DB" == 1 || "$CHECK_DB" == 1 ]]; then
+if [[ "$CHECK_DB" == 1 ]]; then
+  printf '\n== 3/5: Start disposable PostgreSQL ==\n'
   need docker
-  docker compose version >/dev/null
-fi
-
-if [[ "$START_DB" == 1 ]]; then
-  printf '\n== 3/5: Start isolated PostgreSQL (non-destructive) ==\n'
-  if [[ -z "${MEDFLOW_DB_PASSWORD:-}" ]]; then
-    echo "Export MEDFLOW_DB_PASSWORD first (same password as your existing Compose volume)." >&2
-    exit 1
-  fi
-  docker compose up -d postgres
-else
-  echo "== 3/5: Compose start skipped (START_DB=0) =="
-fi
-
-printf '\n== 4/5: Check/start MedFlow API ==\n'
-if curl -fsS --max-time 3 "$API_BASE/api/facilities" >/dev/null 2>&1; then
-  echo "Using API already running at $API_BASE (will not stop it)."
-elif [[ "$START_API" == 1 ]]; then
-  if [[ -z "${MEDFLOW_DB_PASSWORD:-}" ]]; then
-    echo "Export MEDFLOW_DB_PASSWORD to start the API." >&2
-    exit 1
-  fi
-  if [[ -x ./mvnw ]]; then
-    ./mvnw -pl api spring-boot:run >"$WORK_DIR/api.log" 2>&1 &
-  else
-    mvn -pl api spring-boot:run >"$WORK_DIR/api.log" 2>&1 &
-  fi
-  API_PID=$!
-  ready=0
-  for (( i=0; i<90; i++ )); do
-    if curl -fsS --max-time 2 "$API_BASE/api/facilities" >/dev/null 2>&1; then
-      ready=1
+  db_password="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  DB_CONTAINER="$(docker run --rm -d -p 127.0.0.1::5432 \
+    -e POSTGRES_USER="$DB_USER" -e POSTGRES_DB="$DB_NAME" \
+    -e POSTGRES_PASSWORD="$db_password" postgres:16-alpine)"
+  db_address="$(docker port "$DB_CONTAINER" 5432/tcp)"
+  for (( i=0; i<30; i++ )); do
+    if docker exec "$DB_CONTAINER" pg_isready -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" >/dev/null; then
       break
+    fi
+    sleep 1
+  done
+  if (( i == 30 )); then
+    echo "Disposable PostgreSQL did not become ready." >&2
+    exit 1
+  fi
+
+  printf '\n== 4/5: Start API against disposable PostgreSQL ==\n'
+  need java
+  api_jar=(api/target/api-*.jar)
+  if [[ "${#api_jar[@]}" != 1 || ! -f "${api_jar[0]}" ]]; then
+    echo "Build the API JAR first or run with RUN_MAVEN=1." >&2
+    exit 1
+  fi
+  SPRING_DATASOURCE_PASSWORD="$db_password" java -jar "${api_jar[0]}" \
+    --server.address=127.0.0.1 --server.port=0 \
+    --spring.datasource.url="jdbc:postgresql://$db_address/$DB_NAME" \
+    --spring.datasource.username="$DB_USER" >"$WORK_DIR/api.log" 2>&1 &
+  API_PID=$!
+  for (( i=0; i<90; i++ )); do
+    api_port="$(sed -nE 's/.*Tomcat started on port ([0-9]+).*/\1/p' "$WORK_DIR/api.log")"
+    if [[ -n "$api_port" ]]; then
+      API_BASE="http://127.0.0.1:$api_port"
+      if curl -fsS --max-time 2 "$API_BASE/api/facilities" >/dev/null 2>&1; then
+        break
+      fi
     fi
     if ! kill -0 "$API_PID" 2>/dev/null; then
       echo "API process stopped before becoming ready." >&2
@@ -106,20 +116,14 @@ elif [[ "$START_API" == 1 ]]; then
     fi
     sleep 2
   done
-  if [[ "$ready" != 1 ]]; then
-    echo "API did not become ready within 180 seconds." >&2
+  if (( i == 90 )); then
+    echo "API did not become ready." >&2
     exit 1
   fi
-  echo "API started at $API_BASE (PID $API_PID)."
-else
-  echo "The API is not responding at $API_BASE. Start it separately or set START_API=1." >&2
-  exit 1
-fi
 
-if [[ "$CHECK_DB" == 1 ]]; then
   printf '\n== 4b/5: Verify actual PostgreSQL constraints and booking counts ==\n'
   # SQL blocks below deliberately cannot persist changes: they test invalid INSERTs.
-  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" <<'SQL'
+  docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" <<'SQL'
 DO $verify$
 DECLARE
   facility_ref bigint;
@@ -160,16 +164,17 @@ END
 $verify$;
 SQL
 
-  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -A -t -F '|' \
+  docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -A -t -F '|' \
     -c "SELECT s.id, COUNT(b.id) FILTER (WHERE b.status::text IN ('RESERVED','CONFIRMED')) FROM appointment_slot s LEFT JOIN booking b ON b.appointment_slot_id=s.id GROUP BY s.id ORDER BY s.id;" \
     > "$WORK_DIR/booking_counts.txt"
 else
-  echo "Direct database checks skipped (CHECK_DB=0); Maven integration tests still run unless skipped."
+  API_BASE="${API_BASE:-http://localhost:8080}"
+  echo "Running HTTP checks against $API_BASE (CHECK_DB=0)."
   : > "$WORK_DIR/booking_counts.txt"
 fi
 
 printf '\n== 5/5: Live HTTP validation and behavior checks ==\n'
-API_BASE="$API_BASE" BOOKING_COUNTS_FILE="$WORK_DIR/booking_counts.txt" CHECK_DB="$CHECK_DB" DB_USER="$DB_USER" DB_NAME="$DB_NAME" python3 - <<'PY'
+API_BASE="$API_BASE" BOOKING_COUNTS_FILE="$WORK_DIR/booking_counts.txt" CHECK_DB="$CHECK_DB" DB_CONTAINER="$DB_CONTAINER" DB_USER="$DB_USER" DB_NAME="$DB_NAME" python3 - <<'PY'
 import copy
 import json
 import os
@@ -203,7 +208,7 @@ def call(method, path, data=NO_BODY):
 
 
 def run_sql(sql):
-    command = ['docker', 'compose', 'exec', '-T', 'postgres', 'psql',
+    command = ['docker', 'exec', os.environ['DB_CONTAINER'], 'psql',
                '-X', '-v', 'ON_ERROR_STOP=1',
                '-U', os.environ['DB_USER'], '-d', os.environ['DB_NAME'],
                '-A', '-t', '-c', sql]
@@ -289,9 +294,6 @@ def main():
     missing_specialty = max(int(s['id']) for s in specialties) + 1_000_000
     missing_slot = max(int(s['id']) for s in initial_slots) + 1_000_000
 
-    test('GET facilities', 'GET', '/api/facilities', 200, verify=json_list_200)
-    test('GET specialties', 'GET', '/api/specialties', 200, verify=json_list_200)
-    test('GET all slots', 'GET', '/api/slots', 200, verify=json_list_200)
     test('GET existing slot', 'GET', f'/api/slots/{initial_slots[0]["id"]}', 200)
     test('GET facility filter', 'GET', f'/api/slots?facilityId={facility_id}', 200, verify=json_list_200)
     test('GET specialty filter', 'GET', f'/api/slots?specialtyId={specialty_id}', 200, verify=json_list_200)

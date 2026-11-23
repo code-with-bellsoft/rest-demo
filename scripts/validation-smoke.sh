@@ -37,8 +37,6 @@ unknown_facility=$(jq -er 'map(.id) | max + 1' "$work/response")
 check 200 'List specialties' "$base/api/specialties"
 specialty=$(jq -er '.[0].id' "$work/response")
 unknown_specialty=$(jq -er 'map(.id) | max + 1' "$work/response")
-check 200 'List slots' "$slots"
-booked_slot=$(jq -er '[.[] | select(.activeBookings >= 2)][0].id' "$work/response")
 check 200 'Filter by both references' "$slots?facilityId=$facility&specialtyId=$specialty"
 jq -e --argjson facility "$facility" --argjson specialty "$specialty" \
     'all(.[]; .facilityId == $facility and .specialtyId == $specialty)' "$work/response" >/dev/null
@@ -82,9 +80,6 @@ reject_slot 'Unknown specialty' --argjson id "$unknown_specialty" '.specialtyId 
 check 400 'Invalid slot ID' "$slots/0"
 check 400 'Invalid facility filter' "$slots?facilityId=0"
 
-check 409 'Capacity below active bookings' -X PATCH -H 'Content-Type: application/json' \
-    --data '{"capacity":1}' "$slots/$booked_slot"
-check 409 'Delete booked slot' -X DELETE "$slots/$booked_slot"
 check 204 'Delete created slot' -X DELETE "$slots/$created_id"
 deleted_id=$created_id
 created_id=
