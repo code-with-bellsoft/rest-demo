@@ -1,18 +1,22 @@
 package dev.cyberjar.medflow.slot;
 
 import dev.cyberjar.medflow.enums.BookingStatus;
+import dev.cyberjar.medflow.exception.SlotConflictException;
 import dev.cyberjar.medflow.slot.dto.SlotRequest;
 import dev.cyberjar.medflow.slot.dto.SlotResponse;
 import org.jooq.DSLContext;
-import org.jooq.Record1;
+import org.jooq.Record;
+import org.jooq.SelectOnConditionStep;
 import org.jooq.impl.DSL;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
 import java.util.Optional;
 
-import static dev.cyberjar.medflow.Tables.*;
-import static org.jooq.impl.DSL.count;
+import static dev.cyberjar.medflow.Tables.APPOINTMENT_SLOT;
+import static dev.cyberjar.medflow.Tables.BOOKING;
+import static dev.cyberjar.medflow.Tables.FACILITY;
+import static dev.cyberjar.medflow.Tables.SPECIALTY;
 import static org.jooq.impl.DSL.noCondition;
 
 @Repository
@@ -24,178 +28,107 @@ public class AppointmentSlotRepository {
         this.db = db;
     }
 
+    public List<SlotResponse> findSlots(Long facilityId, Long specialtyId) {
+        return selectSlots(db)
+                .where(facilityId == null ? noCondition() : APPOINTMENT_SLOT.FACILITY_ID.eq(facilityId))
+                .and(specialtyId == null ? noCondition() : APPOINTMENT_SLOT.SPECIALTY_ID.eq(specialtyId))
+                .orderBy(APPOINTMENT_SLOT.STARTS_AT, APPOINTMENT_SLOT.ID)
+                .fetch(this::toResponse);
+    }
+
     public Optional<SlotResponse> findSlotById(Long id) {
-        return db.select(
-                        APPOINTMENT_SLOT.ID,
-                        FACILITY.ID,
-                        FACILITY.NAME,
-                        SPECIALTY.ID,
-                        SPECIALTY.NAME,
-                        APPOINTMENT_SLOT.STARTS_AT,
-                        APPOINTMENT_SLOT.ENDS_AT,
-                        APPOINTMENT_SLOT.CAPACITY
-                )
-                .from(APPOINTMENT_SLOT)
-                .join(FACILITY).on(FACILITY.ID.eq(APPOINTMENT_SLOT.FACILITY_ID))
-                .join(SPECIALTY).on(SPECIALTY.ID.eq(APPOINTMENT_SLOT.SPECIALTY_ID))
+        return selectSlots(db)
                 .where(APPOINTMENT_SLOT.ID.eq(id))
-                .fetchOptional(slotRecord -> new SlotResponse(
-                        slotRecord.get(APPOINTMENT_SLOT.ID),
-                        slotRecord.get(FACILITY.ID),
-                        slotRecord.get(FACILITY.NAME),
-                        slotRecord.get(SPECIALTY.ID),
-                        slotRecord.get(SPECIALTY.NAME),
-                        slotRecord.get(APPOINTMENT_SLOT.STARTS_AT),
-                        slotRecord.get(APPOINTMENT_SLOT.ENDS_AT),
-                        slotRecord.get(APPOINTMENT_SLOT.CAPACITY)
-                ));
+                .fetchOptional(this::toResponse);
     }
 
-    public Long createSlot(SlotRequest request) {
-
-        return db.insertInto(APPOINTMENT_SLOT)
-                .set(APPOINTMENT_SLOT.FACILITY_ID, request.facilityId())
-                .set(APPOINTMENT_SLOT.SPECIALTY_ID, request.specialtyId())
-                .set(APPOINTMENT_SLOT.STARTS_AT, request.startsAt())
-                .set(APPOINTMENT_SLOT.ENDS_AT, request.endsAt())
-                .set(APPOINTMENT_SLOT.CAPACITY, request.capacity())
-                .returningResult(APPOINTMENT_SLOT.ID)
-                .fetchOne()
-                .getValue(APPOINTMENT_SLOT.ID);
-
-    }
-
-    public void updateSlot(Long slotId, int newCapacity) {
-
-        db.transactionResult(configuration -> {
-            DSLContext ctx = DSL.using(configuration);
-
-            SlotLockState state = lockSlotAndCountActiveBookings(ctx, slotId);
-
-            if (!state.exists()) return 0;
-
-
-            if (newCapacity < state.activeBookings()) {
-                throw new IllegalStateException(
-                        "Cannot set capacity to " + newCapacity +
-                                " because there are " + state.activeBookings() +
-                                " active bookings (RESERVED/CONFIRMED)."
-                );
-            }
-
-
-            return ctx.update(APPOINTMENT_SLOT)
-                    .set(APPOINTMENT_SLOT.CAPACITY, newCapacity)
-                    .where(APPOINTMENT_SLOT.ID.eq(slotId))
-                    .execute();
-        });
-
-    }
-
-    public int deleteSlot(Long slotId) {
-
+    public SlotResponse createSlot(SlotRequest request) {
         return db.transactionResult(configuration -> {
             DSLContext ctx = DSL.using(configuration);
-
-            SlotLockState state = lockSlotAndCountActiveBookings(ctx, slotId);
-
-            if (!state.exists()) return 0;
-
-
-            if (state.activeBookings() > 0) {
-                throw new IllegalStateException(
-                        "Cannot delete slot because there are " + state.activeBookings() +
-                                " active bookings (RESERVED/CONFIRMED)."
-                );
-            }
-
-
-            return ctx.deleteFrom(APPOINTMENT_SLOT)
-                    .where(APPOINTMENT_SLOT.ID.eq(slotId))
-                    .execute();
+            Long id = ctx.insertInto(APPOINTMENT_SLOT)
+                    .set(APPOINTMENT_SLOT.FACILITY_ID, request.facilityId())
+                    .set(APPOINTMENT_SLOT.SPECIALTY_ID, request.specialtyId())
+                    .set(APPOINTMENT_SLOT.STARTS_AT, request.startsAt())
+                    .set(APPOINTMENT_SLOT.ENDS_AT, request.endsAt())
+                    .set(APPOINTMENT_SLOT.CAPACITY, request.capacity())
+                    .returningResult(APPOINTMENT_SLOT.ID)
+                    .fetchSingle()
+                    .value1();
+            return selectSlots(ctx).where(APPOINTMENT_SLOT.ID.eq(id)).fetchSingle(this::toResponse);
         });
     }
 
-    private SlotLockState lockSlotAndCountActiveBookings(DSLContext ctx, Long slotId) {
+    public Optional<SlotResponse> updateSlot(Long id, int newCapacity) {
+        return db.transactionResult(configuration -> {
+            DSLContext ctx = DSL.using(configuration);
+            if (!lockSlot(ctx, id)) {
+                return Optional.empty();
+            }
 
-        Record1<Long> slot = ctx.select(APPOINTMENT_SLOT.ID)
+            int activeBookings = countActiveBookings(ctx, id);
+            if (newCapacity < activeBookings) {
+                throw new SlotConflictException("Cannot set capacity below the " + activeBookings + " active bookings.");
+            }
+
+            ctx.update(APPOINTMENT_SLOT)
+                    .set(APPOINTMENT_SLOT.CAPACITY, newCapacity)
+                    .where(APPOINTMENT_SLOT.ID.eq(id))
+                    .execute();
+            return Optional.of(selectSlots(ctx).where(APPOINTMENT_SLOT.ID.eq(id)).fetchSingle(this::toResponse));
+        });
+    }
+
+    public boolean deleteSlot(Long id) {
+        return db.transactionResult(configuration -> {
+            DSLContext ctx = DSL.using(configuration);
+            if (!lockSlot(ctx, id)) {
+                return false;
+            }
+
+            if (countActiveBookings(ctx, id) > 0) {
+                throw new SlotConflictException("Cannot delete a slot with active bookings.");
+            }
+
+            return ctx.deleteFrom(APPOINTMENT_SLOT).where(APPOINTMENT_SLOT.ID.eq(id)).execute() == 1;
+        });
+    }
+
+    private boolean lockSlot(DSLContext ctx, Long id) {
+        return ctx.select(APPOINTMENT_SLOT.ID)
                 .from(APPOINTMENT_SLOT)
-                .where(APPOINTMENT_SLOT.ID.eq(slotId))
+                .where(APPOINTMENT_SLOT.ID.eq(id))
                 .forUpdate()
-                .fetchOne();
+                .fetchOptional()
+                .isPresent();
+    }
 
-        if (slot == null) {
-            return SlotLockState.missing();
-        }
-
-        int active = ctx.fetchCount(
+    private int countActiveBookings(DSLContext ctx, Long id) {
+        return ctx.fetchCount(
                 BOOKING,
-                BOOKING.APPOINTMENT_SLOT_ID.eq(slotId),
+                BOOKING.APPOINTMENT_SLOT_ID.eq(id),
                 BOOKING.STATUS.in(BookingStatus.RESERVED, BookingStatus.CONFIRMED)
         );
-
-        return SlotLockState.present(active);
     }
 
-    private record SlotLockState(boolean exists, int activeBookings) {
-
-        static SlotLockState missing() {
-            return new SlotLockState(false, 0);
-        }
-
-        static SlotLockState present(int activeBookings) {
-            return new SlotLockState(true, activeBookings);
-        }
-    }
-
-
-    public List<SlotResponse> findSlots(SlotFilter filter) {
-
-        boolean hasFacility = filter.facilityId() != null;
-        boolean hasDistrict = filter.districtId() != null;
-
-        return db.select(
-                        APPOINTMENT_SLOT.ID,
-                        FACILITY.ID,
-                        FACILITY.NAME,
-                        SPECIALTY.ID,
-                        SPECIALTY.NAME,
-                        APPOINTMENT_SLOT.STARTS_AT,
-                        APPOINTMENT_SLOT.ENDS_AT,
-                        APPOINTMENT_SLOT.CAPACITY
-                )
+    private SelectOnConditionStep<?> selectSlots(DSLContext ctx) {
+        return ctx.select(APPOINTMENT_SLOT.ID, APPOINTMENT_SLOT.FACILITY_ID, FACILITY.NAME,
+                        APPOINTMENT_SLOT.SPECIALTY_ID, SPECIALTY.NAME,
+                        APPOINTMENT_SLOT.STARTS_AT, APPOINTMENT_SLOT.ENDS_AT, APPOINTMENT_SLOT.CAPACITY)
                 .from(APPOINTMENT_SLOT)
                 .join(FACILITY).on(FACILITY.ID.eq(APPOINTMENT_SLOT.FACILITY_ID))
-                .join(SPECIALTY).on(SPECIALTY.ID.eq(APPOINTMENT_SLOT.SPECIALTY_ID))
-                .leftJoin(BOOKING).on(
-                        BOOKING.APPOINTMENT_SLOT_ID.eq(APPOINTMENT_SLOT.ID)
-                                .and(BOOKING.STATUS.in(BookingStatus.RESERVED, BookingStatus.CONFIRMED))
-                )
-                .where(SPECIALTY.ID.eq(filter.specialtyId()))
-                .and(hasFacility ? FACILITY.ID.eq(filter.facilityId()) : noCondition())
-                .and(hasDistrict ? FACILITY.DISTRICT_ID.eq(filter.districtId()) : noCondition())
-                .groupBy(
-                        APPOINTMENT_SLOT.ID,
-                        FACILITY.ID,
-                        FACILITY.NAME,
-                        SPECIALTY.ID,
-                        SPECIALTY.NAME,
-                        APPOINTMENT_SLOT.STARTS_AT,
-                        APPOINTMENT_SLOT.ENDS_AT,
-                        APPOINTMENT_SLOT.CAPACITY
-                )
-                .having(count(BOOKING.ID).lt(APPOINTMENT_SLOT.CAPACITY))
-                .orderBy(APPOINTMENT_SLOT.STARTS_AT.asc())
-                .fetch(slotRecord -> new SlotResponse(
-                        slotRecord.get(APPOINTMENT_SLOT.ID),
-                        slotRecord.get(FACILITY.ID),
-                        slotRecord.get(FACILITY.NAME),
-                        slotRecord.get(SPECIALTY.ID),
-                        slotRecord.get(SPECIALTY.NAME),
-                        slotRecord.get(APPOINTMENT_SLOT.STARTS_AT),
-                        slotRecord.get(APPOINTMENT_SLOT.ENDS_AT),
-                        slotRecord.get(APPOINTMENT_SLOT.CAPACITY)
-                ));
+                .join(SPECIALTY).on(SPECIALTY.ID.eq(APPOINTMENT_SLOT.SPECIALTY_ID));
     }
 
+    private SlotResponse toResponse(Record row) {
+        return new SlotResponse(
+                row.get(APPOINTMENT_SLOT.ID),
+                row.get(APPOINTMENT_SLOT.FACILITY_ID),
+                row.get(FACILITY.NAME),
+                row.get(APPOINTMENT_SLOT.SPECIALTY_ID),
+                row.get(SPECIALTY.NAME),
+                row.get(APPOINTMENT_SLOT.STARTS_AT),
+                row.get(APPOINTMENT_SLOT.ENDS_AT),
+                row.get(APPOINTMENT_SLOT.CAPACITY)
+        );
+    }
 }

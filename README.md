@@ -1,39 +1,12 @@
-# MedFlow (Spring Boot + jOOQ Demo)
+# MedFlow REST Demo
 
-MedFlow is a **Spring Boot REST service** for managing **healthcare appointment slots**, **triage cases**, and **slot suggestions** across facilities.
+MedFlow manages appointment slots through a small REST API. It uses Java 25, Spring Boot 4.1.1 with Spring MVC, PostgreSQL 16, Flyway, jOOQ, and the Maven Wrapper. Maven generates the jOOQ classes from the Flyway schema SQL.
 
-## Data
+Each appointment slot belongs to one facility and one specialty. A slot has a start time, an end time, and a positive capacity. Bookings are read-only fixtures. Only `RESERVED` and `CONFIRMED` bookings count toward capacity. A slot can be deleted when it has zero active bookings. PostgreSQL cascades that deletion to any inactive booking rows for the slot.
 
-- PostgreSQL schema + seed data via **Flyway migrations**
-- Type-safe SQL via **jOOQ** with code generation
+## Run locally
 
-## Tech stack
-
-- Java 25
-- Spring Boot 4
-- PostgreSQL
-- jOOQ (OSS)
-- Flyway
-- Maven (+ Maven Wrapper)
-- Docker Compose for PostgreSQL
-
-### Domain: scheduling & triage
-
-- **Appointment Slots**
-    - List slots with basic filtering (facility/specialty/district)
-    - Fetch slot by ID
-    - Create/update/delete slots
-    - Availability logic excludes fully booked slots (and handles cancelled bookings correctly)
-- **Scheduling**
-    - Suggest slots for a triage case (simple matching logic)
-- **Triage**
-    - Fetch triage case details by ID
-- **Staff**
-    - List staff by specialty
-
-## How to run the application locally
-
-Export a database password:
+Install Java 25 and start Docker. Export a database password:
 ```shell
 export MEDFLOW_DB_PASSWORD=medpass
 ```
@@ -44,7 +17,7 @@ Spin up a database instance:
 docker compose up -d postgres
 ```
 
-for the backend service, run Flyway migrations to create a schema and seed test data:
+For the backend service, run Flyway migrations to create a schema and seed test data:
 
 ```shell
 mvn flyway:migrate
@@ -62,52 +35,60 @@ After that, you can run the application:
 mvn spring-boot:run
 ```
 
-## How to run the application in a container
+Compose starts only PostgreSQL, using project `medflow-rest-demo` and volume `medflow-rest-demo_rest_pgdata`. The app connects to `localhost:5434/medflow_rest` as `meduser` and listens on port 8080. Flyway creates and seeds the schema on first startup.
 
-Export a database password:
-```shell
-export MEDFLOW_DB_PASSWORD=medpass
+## API
+
+| Method | Path | Successful response |
+| --- | --- | --- |
+| GET | `/api/slots` | 200 with all matching slots, including fully booked slots, ordered by start time and then ID |
+| GET | `/api/slots/{id}` | 200 with the slot |
+| POST | `/api/slots` | 201 with the created slot and a `Location` header |
+| PATCH | `/api/slots/{id}` | 200 with the slot after updating its capacity |
+| DELETE | `/api/slots/{id}` | 204 with an empty body |
+| GET | `/api/facilities` | 200 with facility IDs and names |
+| GET | `/api/specialties` | 200 with specialty IDs and names |
+
+The collection accepts optional `facilityId` and `specialtyId` query parameters. Requests for a missing slot return 404. A capacity reduction below the active booking count or deletion of a slot with active bookings returns 409.
+
+[requests.http](requests.http) contains runnable examples for the JetBrains HTTP Client. Run them in order on a fresh database. With curl and jq, you can start by fetching the reference IDs and creating a slot.
+
+```sh
+facility_id=$(curl -fsS localhost:8080/api/facilities | jq '.[0].id')
+specialty_id=$(curl -fsS localhost:8080/api/specialties | jq '.[0].id')
+
+curl -i -H 'Content-Type: application/json' \
+  -d "{\"facilityId\":${facility_id},\"specialtyId\":${specialty_id},\"startsAt\":\"2030-05-01T10:00:00Z\",\"endsAt\":\"2030-05-01T10:30:00Z\",\"capacity\":2}" \
+  localhost:8080/api/slots
 ```
 
-Pick a Dockerfile with the SUFFIX variable (leave SUFFIX empty for the plain extracted-jar image):
-```shell
-SUFFIX=-jlink docker compose up --build
+For example, a fresh database can return:
+
+```http
+HTTP/1.1 201
+Location: /api/slots/5
+Content-Type: application/json
+
+{"id":5,"facilityId":2,"facilityName":"Downtown General Hospital","specialtyId":2,"specialtyName":"Cardiology","startsAt":"2030-05-01T10:00:00Z","endsAt":"2030-05-01T10:30:00Z","capacity":2}
 ```
 
-If the build pulls from a private Maven or Git repository, you can mount the credentials with a BuildKit secret mount, which exists for the duration of one RUN instruction and is not stored in a layer:
+Follow the returned `Location` to retrieve the slot. Send a PATCH to the same path with `{"capacity":3}` to change capacity.
 
-```dockerfile
-RUN --mount=type=secret,id=settings,target=/root/.m2/settings.xml \
-./mvnw package
+## Fixtures
+
+| Facility | Specialty | Capacity | Bookings |
+| --- | --- | ---: | --- |
+| Harbor Community Clinic | General Medicine | 3 | Empty |
+| Harbor Community Clinic | Cardiology | 3 | One reserved and one confirmed |
+| Downtown General Hospital | Cardiology | 1 | One confirmed, fully booked |
+| Downtown General Hospital | General Medicine | 2 | One cancelled, zero active |
+
+The 30-minute slots start seven through ten days after Flyway seeds the database, in table order.
+
+## Tests
+
+```sh
+./mvnw clean verify
 ```
 
-And then:
-```shell
-docker build --secret id=settings,src=$HOME/.m2/settings.xml .
-```
-
-BellSoft Hardened Images come with an SBOM and a digital signature, so in you pipeline you can verify the attestation against [BellSoft's public key](https://download.bell-sw.com/pki/cosign-bellsoft.pub) and retrieve+safe an SBOM with, for example, cosign:
-
-```shell
-IMG='docker.io/bellsoft/hardened-liberica-runtime-container:jre-25-nonroot-musl'
-cosign verify-attestation \
-    --key ~/keys/cosign-bellsoft.pub \
-    --type cyclonedx \
-    $IMG | jq -r '.payload' | base64 -d | jq '.predicate' > sbom.cdx.json
-```
-
-## GitHub Actions: hardened base image security gate
-
-The demo workflow at [`.github/workflows/trivy-scan.yml`](.github/workflows/trivy-scan.yml) checks the security of MedFlow's hardened **runtime base image before building the application image**. It runs on pushes to `main`, pull requests, and manual dispatches.
-
-The workflow:
-
-1. Builds a Trivy scanner container using `dockerfiles/Dockerfile.trivy`, based on BellSoft Alpaquita Linux.
-2. Pulls the hardened JRE image used in the **final stage** of `dockerfiles/Dockerfile`: `bellsoft/hardened-liberica-runtime-container:jre-25-nonroot-musl`.
-3. Runs Trivy inside the Alpaquita container against the locally pulled image, using the GitHub runner's Docker socket. The scan checks vulnerabilities with `--severity CRITICAL --exit-code 1`.
-4. **Builds the MedFlow application image only if the base-image scan succeeds**, skipping Maven test compilation and execution.
-5. Executes an `echo` placeholder for a future security or delivery process.
-
-A CRITICAL vulnerability in the hardened JRE base image, or a Trivy scanning error, **fails the job and prevents the application build**. Lower-severity findings do not block it.
-
-This is deliberately a minimal demonstration: it does **not** scan the JDK builder image or the completed MedFlow image, run tests or other verification jobs, verify signatures or attestations, or publish the application image. The attestation commands above are examples for manual use, not part of this workflow.
+The build regenerates the jOOQ classes. The tests run Spring MVC requests through MockMvc against a fresh PostgreSQL Testcontainer. They use Docker and create their own database and credentials.

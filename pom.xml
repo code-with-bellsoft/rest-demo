@@ -9,19 +9,15 @@
         <relativePath/> <!-- lookup parent from repository -->
     </parent>
     <groupId>dev.cyberjar</groupId>
-    <artifactId>med-flow</artifactId>
+    <artifactId>medflow-rest-demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>med-flow</name>
-    <description>med-flow</description>
+    <name>MedFlow REST Demo</name>
+    <description>Appointment slot REST API demo</description>
 
     <properties>
         <java.version>25</java.version>
     </properties>
     <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-jooq</artifactId>
@@ -36,19 +32,9 @@
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-validation</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>
         </dependency>
 
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-docker-compose</artifactId>
-            <scope>runtime</scope>
-            <optional>true</optional>
-        </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
@@ -56,22 +42,17 @@
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-jooq-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-validation-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -79,76 +60,8 @@
     <build>
         <plugins>
             <plugin>
-                <groupId>org.graalvm.buildtools</groupId>
-                <artifactId>native-maven-plugin</artifactId>
-            </plugin>
-            <plugin>
-                <groupId>org.cyclonedx</groupId>
-                <artifactId>cyclonedx-maven-plugin</artifactId>
-                <version>2.9.3</version>
-
-                <executions>
-                    <execution>
-                        <id>make-app-sbom</id>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>makeBom</goal>
-                        </goals>
-
-                        <configuration>
-                            <includeCompileScope>true</includeCompileScope>
-                            <includeRuntimeScope>true</includeRuntimeScope>
-
-                            <includeTestScope>false</includeTestScope>
-                            <includeProvidedScope>false</includeProvidedScope>
-                            <includeSystemScope>false</includeSystemScope>
-
-                            <outputFormat>json</outputFormat>
-                            <outputName>app-sbom</outputName>
-                            <outputDirectory>${project.build.directory}</outputDirectory>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <image>
-                        <builder>bellsoft/buildpacks.builder:musl</builder>
-                        <pullPolicy>ALWAYS</pullPolicy>
-                        <env>
-                            <BP_JVM_VERSION>25</BP_JVM_VERSION>
-<!--                            <BP_JVM_JLINK_ENABLED>true</BP_JVM_JLINK_ENABLED>-->
-<!--                            <BP_JVM_AOTCACHE_ENABLED>true</BP_JVM_AOTCACHE_ENABLED>-->
-                        </env>
-                    </image>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.flywaydb</groupId>
-                <artifactId>flyway-maven-plugin</artifactId>
-                <version>${flyway.version}</version>
-
-                <configuration>
-                    <user>meduser</user>
-                    <password>medpass</password>
-                    <url>jdbc:postgresql://localhost:5433/medflow</url>
-                </configuration>
-
-                <dependencies>
-                    <dependency>
-                        <groupId>org.flywaydb</groupId>
-                        <artifactId>flyway-database-postgresql</artifactId>
-                        <version>${flyway.version}</version>
-                    </dependency>
-
-                    <dependency>
-                        <groupId>org.postgresql</groupId>
-                        <artifactId>postgresql</artifactId>
-                        <version>${postgresql.version}</version>
-                    </dependency>
-                </dependencies>
             </plugin>
             <plugin>
                 <groupId>org.jooq</groupId>
@@ -168,12 +81,14 @@
                         <database>
                             <name>org.jooq.meta.extensions.ddl.DDLDatabase</name>
 
-                            <includes>.*</includes>
+                            <inputSchema>PUBLIC</inputSchema>
+                            <outputSchema>public</outputSchema>
 
                             <properties>
                                 <property>
                                     <key>scripts</key>
-                                    <value>${project.basedir}/src/main/resources/db/migration/schema/*.sql</value>                                </property>
+                                    <value>${project.basedir}/src/main/resources/db/migration/schema/*.sql</value>
+                                </property>
 
                                 <property>
                                     <key>sort</key>

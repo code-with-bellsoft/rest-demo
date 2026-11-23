@@ -1,50 +1,21 @@
+name: medflow-rest-demo
+
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: medflow-postgres
     environment:
-      POSTGRES_DB: medflow
+      POSTGRES_DB: medflow_rest
       POSTGRES_USER: meduser
       POSTGRES_PASSWORD: ${MEDFLOW_DB_PASSWORD}
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5434:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U meduser -d medflow"]
+      test: ["CMD", "pg_isready", "-U", "meduser", "-d", "medflow_rest"]
       interval: 5s
       timeout: 3s
       retries: 10
     volumes:
-      - medflow_pgdata:/var/lib/postgresql/data
-
-  app:
-    build:
-      context: .
-      dockerfile: ./dockerfiles/Dockerfile${SUFFIX}
-
-    image: medflow:latest
-    container_name: medflow-app
-
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/medflow
-      SPRING_DATASOURCE_USERNAME: meduser
-      SPRING_DATASOURCE_PASSWORD: ${MEDFLOW_DB_PASSWORD}
-
-      JDK_JAVA_OPTIONS: >-
-        -XX:MaxRAMPercentage=70
-        -XX:+UseG1GC
-        -XX:+UseCompactObjectHeaders
-
-    cpus: 2.0
-    mem_limit: 1g
-
-    stop_grace_period: 25s
-
-    ports:
-      - "8080:8080"
+      - rest_pgdata:/var/lib/postgresql/data
 
 volumes:
-  medflow_pgdata:
+  rest_pgdata:

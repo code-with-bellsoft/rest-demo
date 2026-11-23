@@ -1,0 +1,92 @@
+@base = http://localhost:8080
+
+### Facilities
+GET {{base}}/api/facilities
+
+> {%
+    client.global.set("harborId", response.body.find(entry => entry.name === "Harbor Community Clinic").id);
+%}
+
+### Specialties
+GET {{base}}/api/specialties
+
+> {%
+    client.global.set("cardiologyId", response.body.find(entry => entry.name === "Cardiology").id);
+%}
+
+### All slots, including fully booked slots
+GET {{base}}/api/slots
+
+> {%
+    const slots = response.body;
+    client.global.set("fullSlotId", slots.find(slot => slot.facilityName === "Downtown General Hospital" &&
+        slot.specialtyName === "Cardiology").id);
+    client.global.set("bookedSlotId", slots.find(slot => slot.facilityName === "Harbor Community Clinic" &&
+        slot.specialtyName === "Cardiology").id);
+%}
+
+### Filter by facility
+GET {{base}}/api/slots?facilityId={{harborId}}
+
+### Filter by specialty
+GET {{base}}/api/slots?specialtyId={{cardiologyId}}
+
+### Filter by both
+GET {{base}}/api/slots?facilityId={{harborId}}&specialtyId={{cardiologyId}}
+
+### Retrieve the fully booked slot
+GET {{base}}/api/slots/{{fullSlotId}}
+
+### Create a slot
+< {%
+    const startsAt = new Date(Date.now() + 14 * 86400000);
+    request.variables.set("startsAt", startsAt.toISOString());
+    request.variables.set("endsAt", new Date(startsAt.getTime() + 30 * 60000).toISOString());
+%}
+POST {{base}}/api/slots
+Content-Type: application/json
+
+{
+  "facilityId": {{harborId}},
+  "specialtyId": {{cardiologyId}},
+  "startsAt": "{{startsAt}}",
+  "endsAt": "{{endsAt}}",
+  "capacity": 2
+}
+
+> {%
+    client.global.set("createdLocation", response.headers.valueOf("Location"));
+%}
+
+### Retrieve the created slot
+GET {{base}}{{createdLocation}}
+
+### Change capacity
+PATCH {{base}}{{createdLocation}}
+Content-Type: application/json
+
+{"capacity": 3}
+
+### Reject capacity below two active bookings (409)
+PATCH {{base}}/api/slots/{{bookedSlotId}}
+Content-Type: application/json
+
+{"capacity": 1}
+
+### Reject deletion with active bookings (409)
+DELETE {{base}}/api/slots/{{bookedSlotId}}
+
+### Delete the created slot (204)
+DELETE {{base}}{{createdLocation}}
+
+### Retrieve the deleted slot (404)
+GET {{base}}{{createdLocation}}
+
+### Update the deleted slot (404)
+PATCH {{base}}{{createdLocation}}
+Content-Type: application/json
+
+{"capacity": 3}
+
+### Delete it again (404)
+DELETE {{base}}{{createdLocation}}

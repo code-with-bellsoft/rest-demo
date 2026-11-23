@@ -1,46 +1,44 @@
 package dev.cyberjar.medflow.slot;
 
-
 import dev.cyberjar.medflow.exception.NotFoundException;
 import dev.cyberjar.medflow.slot.dto.SlotRequest;
 import dev.cyberjar.medflow.slot.dto.SlotResponse;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Optional;
 
 @Service
 public class AppointmentSlotService {
 
     private final AppointmentSlotRepository repository;
 
-    public AppointmentSlotService(AppointmentSlotRepository appointmentSlotRepository) {
-        this.repository = appointmentSlotRepository;
+    public AppointmentSlotService(AppointmentSlotRepository repository) {
+        this.repository = repository;
     }
 
-    public List<SlotResponse> findSlots(SlotFilter filter) {
-        return repository.findSlots(filter);
+    public List<SlotResponse> findSlots(Long facilityId, Long specialtyId) {
+        return repository.findSlots(facilityId, specialtyId);
     }
 
     public SlotResponse findSlotById(Long id) {
-        Optional<SlotResponse> response = repository.findSlotById(id);
-        if (response.isEmpty()) {
-            throw new NotFoundException("Slot with id " + id + " not found");
-        }
-        return response.get();
+        return repository.findSlotById(id).orElseThrow(() -> slotNotFound(id));
     }
 
-    public Long createSlot(SlotRequest slot) {
-
+    public SlotResponse createSlot(SlotRequest slot) {
         return repository.createSlot(slot);
     }
 
-    public void updateSlot(Long slotId, int newCapacity) {
-        repository.updateSlot(slotId, newCapacity);
+    public SlotResponse updateSlot(Long id, int newCapacity) {
+        return repository.updateSlot(id, newCapacity).orElseThrow(() -> slotNotFound(id));
     }
 
-    public void deleteSlot(Long slotId) {
-        repository.deleteSlot(slotId);
+    public void deleteSlot(Long id) {
+        if (!repository.deleteSlot(id)) {
+            throw slotNotFound(id);
+        }
     }
 
+    private NotFoundException slotNotFound(Long id) {
+        return new NotFoundException("Slot with id " + id + " not found");
+    }
 }
