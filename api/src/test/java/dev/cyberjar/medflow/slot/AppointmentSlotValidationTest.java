@@ -17,21 +17,27 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.hamcrest.Matchers.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @WebMvcTest(AppointmentSlotController.class)
 class AppointmentSlotValidationTest {
@@ -82,7 +88,18 @@ class AppointmentSlotValidationTest {
             default -> body.put(field, Integer.parseInt(input));
         }
 
-        rejectsCreation(body);
+        var result = rejectsCreation(body);
+        if (input.equals("invalid")) {
+            unreadableBody(result);
+        } else {
+            String message = switch (input) {
+                case "missing", "null" -> "must not be null";
+                case "past" -> "must be a future date";
+                case "reversed", "equal" -> "End time must be later than start time";
+                default -> "must be greater than 0";
+            };
+            validationError(result, field, message);
+        }
     }
 
     @ParameterizedTest
@@ -97,21 +114,28 @@ class AppointmentSlotValidationTest {
     @Test
     void rejectsUnknownFacilityBeforeCallingService() throws Exception {
         when(references.existsSpecialtyById(SPECIALTY)).thenReturn(true);
-        rejectsCreation(validBody().put("facilityId", UNKNOWN));
+        validationError(rejectsCreation(validBody().put("facilityId", UNKNOWN)),
+                "facilityId", "Facility does not exist");
         verify(references).existsFacilityById(UNKNOWN);
     }
 
     @Test
     void rejectsUnknownSpecialtyBeforeCallingService() throws Exception {
         when(references.existsFacilityById(FACILITY)).thenReturn(true);
-        rejectsCreation(validBody().put("specialtyId", UNKNOWN));
+        validationError(rejectsCreation(validBody().put("specialtyId", UNKNOWN)),
+                "specialtyId", "Specialty does not exist");
         verify(references).existsSpecialtyById(UNKNOWN);
     }
 
     @Test
     void rejectsMultipleViolationsInOneRequest() throws Exception {
-        rejectsCreation(validBody().put("facilityId", -1).put("specialtyId", UNKNOWN)
+        var result = rejectsCreation(validBody().put("facilityId", -1).put("specialtyId", UNKNOWN)
                 .put("capacity", 0).put("endsAt", start.minusMinutes(30).toString()));
+        result.andExpect(jsonPath("$.errors", hasSize(4)));
+        validationError(result, "facilityId", "must be greater than 0");
+        validationError(result, "specialtyId", "Specialty does not exist");
+        validationError(result, "capacity", "must be greater than 0");
+        validationError(result, "endsAt", "End time must be later than start time");
         verify(references).existsSpecialtyById(UNKNOWN);
         verifyNoMoreInteractions(references);
     }
@@ -175,7 +199,7 @@ class AppointmentSlotValidationTest {
             if (method.equals(HttpMethod.PATCH)) {
                 request.contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}");
             }
-            mvc.perform(request).andExpect(status().isBadRequest());
+            parameterError(mvc.perform(request), SLOTS + "/" + id, "id", id);
         }
         verifyNoInteractions(service);
     }
@@ -183,7 +207,7 @@ class AppointmentSlotValidationTest {
     @ParameterizedTest
     @CsvSource({"facilityId, 0", "specialtyId, -1", "facilityId, abc"})
     void rejectsInvalidFilters(String name, String value) throws Exception {
-        mvc.perform(get(SLOTS).param(name, value)).andExpect(status().isBadRequest());
+        parameterError(mvc.perform(get(SLOTS).param(name, value)), SLOTS, name, value);
         verifyNoInteractions(service, references);
     }
 
@@ -191,9 +215,85 @@ class AppointmentSlotValidationTest {
     @ValueSource(strings = {"{\"capacity\":0}", "{\"capacity\":-1}", "{\"capacity\":null}",
             "{}", "{\"capacity\":\"abc\"}"})
     void rejectsInvalidCapacityUpdates(String body) throws Exception {
-        mvc.perform(patch(SLOTS + "/1").contentType(MediaType.APPLICATION_JSON).content(body))
-                .andExpect(status().isBadRequest());
+        var result = problem(mvc.perform(patch(SLOTS + "/1").contentType(MediaType.APPLICATION_JSON)
+                .content(body)), 400, "Bad Request", SLOTS + "/1");
+        if (body.contains("abc")) {
+            unreadableBody(result);
+        } else {
+            validationError(result, "capacity", body.equals("{}") || body.contains("null")
+                    ? "must not be null" : "must be greater than 0");
+        }
         verifyNoInteractions(service);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "{"})
+    void rejectsMissingBodyOrMalformedJson(String body) throws Exception {
+        unreadableBody(problem(mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content(body)),
+                400, "Bad Request", SLOTS));
+        verifyNoInteractions(service, references);
+    }
+
+    @Test
+    void preservesHttpProtocolErrorsAndHeaders() throws Exception {
+        problem(mvc.perform(put(SLOTS)), 405, "Method Not Allowed", SLOTS)
+                .andExpect(header().string(HttpHeaders.ALLOW, allOf(containsString("GET"), containsString("POST"))));
+        problem(mvc.perform(post(SLOTS).contentType(MediaType.TEXT_PLAIN).content("{}")),
+                415, "Unsupported Media Type", SLOTS)
+                .andExpect(header().string(HttpHeaders.ACCEPT, containsString("application/json")));
+        when(service.findSlots(null, null)).thenReturn(List.of());
+        mvc.perform(get(SLOTS).accept(MediaType.IMAGE_PNG))
+                .andExpect(status().isNotAcceptable())
+                .andExpect(header().doesNotExist(HttpHeaders.CONTENT_TYPE))
+                .andExpect(content().string(""));
+        when(service.findSlots(null, null)).thenAnswer(invocation -> {
+            throw new HttpMediaTypeNotAcceptableException(List.of(MediaType.APPLICATION_JSON));
+        });
+        problem(mvc.perform(get(SLOTS).accept(MediaType.APPLICATION_PROBLEM_JSON)), 406, "Not Acceptable", SLOTS)
+                .andExpect(header().string(HttpHeaders.ACCEPT, "application/json"));
+    }
+
+    @Test
+    void returnsSafeProblemForUnexpectedDatabaseFailures() throws Exception {
+        String internal = "SELECT secret FROM internal_table with password: demo-secret";
+        when(service.findSlots(null, null)).thenThrow(new DataIntegrityViolationException(internal));
+        problem(mvc.perform(get(SLOTS)), 500, "Internal Server Error", SLOTS)
+                .andExpect(jsonPath("$.detail").value("The server could not complete the request"))
+                .andExpect(jsonPath("$.errors").doesNotExist())
+                .andExpect(jsonPath("$.trace").doesNotExist())
+                .andExpect(content().string(not(anyOf(containsString("SELECT"), containsString("internal_table"),
+                        containsString("demo-secret"), containsString("DataIntegrityViolationException")))));
+    }
+
+    static ResultActions problem(ResultActions result, int statusCode, String title, String path) throws Exception {
+        return result.andExpect(status().is(statusCode))
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.type").value("about:blank"))
+                .andExpect(jsonPath("$.title").value(title))
+                .andExpect(jsonPath("$.status").value(statusCode))
+                .andExpect(jsonPath("$.detail").isNotEmpty())
+                .andExpect(jsonPath("$.instance").value(path));
+    }
+
+    private void parameterError(ResultActions result, String path, String field, String value) throws Exception {
+        problem(result, 400, "Bad Request", path);
+        if (value.equals("abc")) {
+            result.andExpect(jsonPath("$.detail").value("A request parameter has an invalid format"))
+                    .andExpect(jsonPath("$.errors").doesNotExist());
+        } else {
+            validationError(result, field, "must be greater than 0");
+        }
+    }
+
+    private void validationError(ResultActions result, String field, String message) throws Exception {
+        result.andExpect(jsonPath("$.detail").value("Request validation failed"))
+                .andExpect(jsonPath("$.errors[?(@.field == '%s' && @.message == '%s')]", field, message)
+                        .value(hasSize(1)));
+    }
+
+    private void unreadableBody(ResultActions result) throws Exception {
+        result.andExpect(jsonPath("$.detail").value("Failed to read request"))
+                .andExpect(jsonPath("$.errors").doesNotExist());
     }
 
     private ObjectNode validBody() {
@@ -201,9 +301,10 @@ class AppointmentSlotValidationTest {
                 .put("startsAt", start.toString()).put("endsAt", end.toString()).put("capacity", 2);
     }
 
-    private void rejectsCreation(ObjectNode body) throws Exception {
-        mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content(body.toString()))
-                .andExpect(status().isBadRequest());
+    private ResultActions rejectsCreation(ObjectNode body) throws Exception {
+        var result = problem(mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content(body.toString())),
+                400, "Bad Request", SLOTS);
         verifyNoInteractions(service);
+        return result;
     }
 }

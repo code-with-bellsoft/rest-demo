@@ -34,12 +34,14 @@ public class SlotApiClient {
     private final ObjectReader slotsReader;
     private final ObjectReader slotReader;
     private final ObjectReader referenceReader;
+    private final ObjectReader problemReader;
 
     public SlotApiClient(RestClient client, JsonMapper mapper) {
         this.client = client;
         var reader = mapper.reader().without(DateTimeFeature.ADJUST_DATES_TO_CONTEXT_TIME_ZONE);
         slotsReader = reader.forType(new TypeReference<List<SlotDto>>() {});
         slotReader = reader.forType(SlotDto.class);
+        problemReader = mapper.reader();
         referenceReader = reader.forType(new TypeReference<List<ReferenceDto>>() {});
     }
 
@@ -77,7 +79,7 @@ public class SlotApiClient {
             captured.set(new HttpExchange.Request(outgoing.getMethod(), outgoing.getURI(),
                     HttpExchange.visibleHeaders(outgoing.getHeaders()), new String(bytes, StandardCharsets.UTF_8)));
             return execution.execute(outgoing, bytes);
-        }).build().method(method).uri(uri).accept(MediaType.APPLICATION_JSON);
+        }).build().method(method).uri(uri).accept(MediaType.APPLICATION_JSON, MediaType.APPLICATION_PROBLEM_JSON);
         if (body != null) {
             request.contentType(MediaType.APPLICATION_JSON).body(body);
         }
@@ -96,7 +98,7 @@ public class SlotApiClient {
                 }
                 var exchange = new HttpExchange(captured.get(), new HttpExchange.Response(status, headers, text));
                 if (!status.is2xxSuccessful()) {
-                    return new Result<>(null, exchange, "HTTP " + exchange.response().statusLine());
+                    return new Result<>(null, exchange, errorMessage(exchange.response()));
                 }
                 if (reader == null) {
                     return new Result<>(null, exchange, null);
@@ -116,6 +118,27 @@ public class SlotApiClient {
             return new Result<>(null, new HttpExchange(captured.get(), null),
                     "Connection failure. Check that the MedFlow REST API is reachable.");
         }
+    }
+
+    private String errorMessage(HttpExchange.Response response) {
+        var message = new StringBuilder("HTTP ").append(response.statusLine());
+        try {
+            if (MediaType.APPLICATION_PROBLEM_JSON.isCompatibleWith(response.headers().getContentType())) {
+                var problem = problemReader.readTree(response.body());
+                if (problem.path("detail").isTextual()) {
+                    message.append(" · ").append(problem.path("detail").asString());
+                }
+                for (var error : problem.path("errors")) {
+                    if (error.path("field").isTextual() && error.path("message").isTextual()) {
+                        message.append(" · ").append(error.path("field").asString())
+                                .append(": ").append(error.path("message").asString());
+                    }
+                }
+            }
+        } catch (JacksonException | InvalidMediaTypeException e) {
+            // Keep the HTTP status and the original inspector response for malformed problems.
+        }
+        return message.toString();
     }
 
     private Charset responseCharset(HttpHeaders headers) {

@@ -30,10 +30,10 @@ public class HttpExchangePanel extends Div {
     public void show(HttpExchange exchange) {
         var outgoing = exchange.request();
         request.setText(outgoing == null ? "Request could not be sent."
-                : format(outgoing.method() + " " + outgoing.uri(), outgoing.headers(), outgoing.body()));
+                : format(outgoing.method() + " " + outgoing.uri(), outgoing.headers(), outgoing.body(), true));
         var incoming = exchange.response();
         response.setText(incoming == null ? "Connection failure · No HTTP response."
-                : format(incoming.statusLine(), incoming.headers(), incoming.body()));
+                : format(incoming.statusLine(), incoming.headers(), incoming.body(), incoming.status().is2xxSuccessful()));
     }
 
     private Div section(String title, Pre content) {
@@ -58,19 +58,22 @@ public class HttpExchangePanel extends Div {
         return new Div(heading, content);
     }
 
-    private String format(String firstLine, HttpHeaders headers, String body) {
+    private String format(String firstLine, HttpHeaders headers, String body, boolean prettyPrint) {
         var text = new StringBuilder(firstLine).append('\n');
         headers.headerSet().forEach(header -> header.getValue().forEach(value ->
                 text.append(header.getKey()).append(": ").append(value).append('\n')));
-        return text.append('\n').append(displayBody(headers, body)).toString();
+        return text.append('\n').append(displayBody(headers, body, prettyPrint)).toString();
     }
 
-    private String displayBody(HttpHeaders headers, String body) {
+    private String displayBody(HttpHeaders headers, String body, boolean prettyPrint) {
         if (body == null) {
             return "(Response body could not be read.)";
         }
         if (body.isEmpty()) {
             return "(No body)";
+        }
+        if (!prettyPrint) {
+            return body;
         }
         try {
             var contentType = headers.getContentType();

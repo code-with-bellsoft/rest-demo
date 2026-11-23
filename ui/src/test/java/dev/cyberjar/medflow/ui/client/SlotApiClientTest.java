@@ -7,6 +7,7 @@ import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.dialog.Dialog;
 import com.vaadin.flow.component.grid.Grid;
 import com.vaadin.flow.component.html.Pre;
+import com.vaadin.flow.component.notification.Notification;
 import com.vaadin.flow.component.textfield.IntegerField;
 import com.vaadin.flow.server.VaadinSession;
 import com.vaadin.flow.dom.Element;
@@ -43,6 +44,13 @@ class SlotApiClientTest {
             "\"activeBookings\":0,\"remainingCapacity\":2");
     private static final String FACILITIES = "[{\"id\":2,\"name\":\"Harbor\"}]";
     private static final String SPECIALTIES = "[{\"id\":3,\"name\":\"Cardiology\"}]";
+
+    private static final String ACCEPT = "application/json, application/problem+json";
+    private static final String VALIDATION_PROBLEM = """
+            {"type":"about:blank","title":"Bad Request","status":400,
+             "detail":"Request validation failed","instance":"/api/slots/42",
+             "errors":[{"field":"capacity","message":"must be greater than 0"}]}""";
+    private static final String PROBLEM_JSON = "application/problem+json";
 
     private final Queue<Reply> replies = new ConcurrentLinkedQueue<>();
     private final Queue<SeenRequest> requests = new ConcurrentLinkedQueue<>();
@@ -152,7 +160,7 @@ class SlotApiClientTest {
     void patchesOnlyCapacityAndLetsTheApiRejectZero() {
         replies.add(Reply.json(200, SLOT.replace("\"capacity\":2", "\"capacity\":3")
                 .replace("\"remainingCapacity\":0", "\"remainingCapacity\":1")));
-        replies.add(Reply.json(400, "{\"status\":400}"));
+        replies.add(new Reply(400, PROBLEM_JSON, null, VALIDATION_PROBLEM));
 
         var updated = client.updateCapacity(42L, new UpdateCapacityRequest(3));
         assertThat(updated.succeeded()).isTrue();
@@ -160,12 +168,12 @@ class SlotApiClientTest {
         assertThat(updated.value().activeBookings()).isEqualTo(2);
         assertThat(updated.value().remainingCapacity()).isEqualTo(1);
         assertThat(requests.remove()).isEqualTo(new SeenRequest("PATCH", "/api/slots/42",
-                "application/json", "application/json", "{\"capacity\":3}"));
+                "application/json", ACCEPT, "{\"capacity\":3}"));
 
         var rejected = client.updateCapacity(42L, new UpdateCapacityRequest(0));
         assertThat(requests.remove().body()).isEqualTo("{\"capacity\":0}");
-        assertThat(rejected.error()).isEqualTo("HTTP 400 Bad Request");
-        assertThat(rejected.exchange().response().body()).isEqualTo("{\"status\":400}");
+        assertThat(rejected.error()).isEqualTo("HTTP 400 Bad Request · Request validation failed · capacity: must be greater than 0");
+        assertThat(rejected.exchange().response().body()).isEqualTo(VALIDATION_PROBLEM);
     }
 
     @Test
@@ -174,7 +182,7 @@ class SlotApiClientTest {
         var result = client.delete(42L);
 
         assertThat(requests.remove()).isEqualTo(new SeenRequest("DELETE", "/api/slots/42",
-                null, "application/json", ""));
+                null, ACCEPT, ""));
         assertThat(result.succeeded()).isTrue();
         assertThat(result.exchange().response().statusLine()).isEqualTo("204 No Content");
         assertThat(result.exchange().response().body()).isEmpty();
@@ -182,19 +190,29 @@ class SlotApiClientTest {
 
     @Test
     void preservesErrorBodiesIncludingPlainTextServerErrors() {
-        replies.add(Reply.json(404, "{\"status\":404}"));
-        replies.add(Reply.json(409, "{\"status\":409}"));
+        String missingBody = "{\"status\":404,\"detail\":\"Slot with id 42 not found\"}";
+        String conflictBody = "{\"status\":409,\"detail\":\"Cannot delete a slot with active bookings.\"}";
+        replies.add(new Reply(404, PROBLEM_JSON, null, missingBody));
+        replies.add(new Reply(409, PROBLEM_JSON, null, conflictBody));
+        replies.add(new Reply(500, PROBLEM_JSON, null,
+                "{\"status\":500,\"detail\":\"The server could not complete the request\"}"));
         replies.add(new Reply(503, "text/plain", null, "Service temporarily unavailable"));
+        replies.add(new Reply(502, PROBLEM_JSON, null, "{"));
 
         var missing = client.delete(42L);
-        assertThat(missing.error()).isEqualTo("HTTP 404 Not Found");
-        assertThat(missing.exchange().response().body()).isEqualTo("{\"status\":404}");
+        assertThat(missing.error()).isEqualTo("HTTP 404 Not Found · Slot with id 42 not found");
+        assertThat(missing.exchange().response().body()).isEqualTo(missingBody);
         var conflict = client.delete(42L);
-        assertThat(conflict.error()).isEqualTo("HTTP 409 Conflict");
-        assertThat(conflict.exchange().response().body()).isEqualTo("{\"status\":409}");
+        assertThat(conflict.error()).isEqualTo("HTTP 409 Conflict · Cannot delete a slot with active bookings.");
+        assertThat(conflict.exchange().response().body()).isEqualTo(conflictBody);
+        assertThat(client.slots(null, null).error())
+                .isEqualTo("HTTP 500 Internal Server Error · The server could not complete the request");
         var unavailable = client.slots(null, null);
         assertThat(unavailable.error()).isEqualTo("HTTP 503 Service Unavailable");
         assertThat(unavailable.exchange().response().body()).isEqualTo("Service temporarily unavailable");
+        var malformed = client.slots(null, null);
+        assertThat(malformed.error()).isEqualTo("HTTP 502 Bad Gateway");
+        assertThat(malformed.exchange().response().body()).isEqualTo("{");
     }
 
     @Test
@@ -242,20 +260,35 @@ class SlotApiClientTest {
 
             String updatedSlot = SLOT.replace("\"capacity\":2", "\"capacity\":3")
                     .replace("\"remainingCapacity\":0", "\"remainingCapacity\":1");
+            replies.add(new Reply(400, PROBLEM_JSON, null, VALIDATION_PROBLEM));
             replies.add(Reply.json(200, updatedSlot));
             replies.add(Reply.json(200, "[" + updatedSlot + "]"));
             descendants(view, Button.class).filter(button -> button.getText().equals("Edit capacity"))
                     .findFirst().orElseThrow().click();
             ui.getInternals().getStateTree().runExecutionsBeforeClientResponse();
             var dialog = descendants(ui, Dialog.class).findFirst().orElseThrow();
-            descendants(dialog, IntegerField.class).findFirst().orElseThrow().setValue(3);
-            dialog.getFooter().getElement().getChildren().flatMap(element -> element.getComponent().stream())
+            var capacity = descendants(dialog, IntegerField.class).findFirst().orElseThrow();
+            var save = dialog.getFooter().getElement().getChildren().flatMap(element -> element.getComponent().stream())
                     .filter(Button.class::isInstance).map(Button.class::cast)
                     .filter(button -> button.getText().equals("Save capacity"))
-                    .findFirst().orElseThrow().click();
+                    .findFirst().orElseThrow();
 
+            capacity.setValue(0);
+            save.click();
+            assertThat(dialog.isOpened()).isTrue();
+            assertThat(requests).extracting(SeenRequest::method).containsExactly("GET", "GET", "GET", "PATCH");
+            assertThat(descendants(view, Pre.class).map(Pre::getText)).anyMatch(text ->
+                    text.startsWith("400 Bad Request") && text.contains(PROBLEM_JSON)
+                            && text.endsWith(VALIDATION_PROBLEM));
+            ui.getInternals().getStateTree().runExecutionsBeforeClientResponse();
+            assertThat(descendants(ui, Notification.class).map(notification ->
+                    notification.getElement().getProperty("text", "")))
+                    .anyMatch(text -> text.contains("capacity: must be greater than 0"));
+
+            capacity.setValue(3);
+            save.click();
             assertThat(requests).extracting(SeenRequest::method)
-                    .containsExactly("GET", "GET", "GET", "PATCH", "GET");
+                    .containsExactly("GET", "GET", "GET", "PATCH", "PATCH", "GET");
             assertThat(grid.getGenericDataView().getItems()).singleElement()
                     .satisfies(updated -> assertThat(updated.capacity()).isEqualTo(3));
             assertThat(descendants(view, Pre.class).map(Pre::getText)).anyMatch(text ->

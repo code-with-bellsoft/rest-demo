@@ -174,7 +174,7 @@ else
 fi
 
 printf '\n== 5/5: Live HTTP validation and behavior checks ==\n'
-API_BASE="$API_BASE" BOOKING_COUNTS_FILE="$WORK_DIR/booking_counts.txt" CHECK_DB="$CHECK_DB" DB_CONTAINER="$DB_CONTAINER" DB_USER="$DB_USER" DB_NAME="$DB_NAME" python3 - <<'PY'
+VERIFY_PROBLEMS="${VERIFY_PROBLEMS:-0}" API_BASE="$API_BASE" BOOKING_COUNTS_FILE="$WORK_DIR/booking_counts.txt" CHECK_DB="$CHECK_DB" DB_CONTAINER="$DB_CONTAINER" DB_USER="$DB_USER" DB_NAME="$DB_NAME" python3 - <<'PY'
 import copy
 import json
 import os
@@ -183,17 +183,30 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from http import HTTPStatus
 from datetime import datetime, timedelta, timezone
 
 BASE = os.environ['API_BASE']
+VERIFY_PROBLEMS = os.environ['VERIFY_PROBLEMS'] == '1'
 NO_BODY = object()
 checks = 0
 failures = []
 created_paths = []
 
 
-def call(method, path, data=NO_BODY):
+def call(method, path, data=NO_BODY, accept=None, content_type=None):
     url = urllib.parse.urljoin(BASE + '/', path.lstrip('/'))
+    if VERIFY_PROBLEMS:
+        args = ['curl', '--silent', '--show-error', '--include', '--max-time', '20',
+                '--request', method, '--header', f'Accept: {accept or "application/json, application/problem+json"}']
+        if data is not NO_BODY:
+            args += ['--header', f'Content-Type: {content_type or "application/json"}',
+                     '--data-binary', data if isinstance(data, str) else json.dumps(data)]
+        raw = subprocess.check_output([*args, url])
+        head, body = raw.split(b'\r\n\r\n', 1)
+        status_line, *header_lines = head.decode('iso-8859-1').splitlines()
+        headers = dict(line.split(':', 1) for line in header_lines)
+        return int(status_line.split()[1]), {key: value.strip() for key, value in headers.items()}, body.decode()
     headers = {'Accept': 'application/json'}
     payload = None
     if data is not NO_BODY:
@@ -229,11 +242,20 @@ def get_header(headers, name):
     return next((v for k, v in headers.items() if k.lower() == name.lower()), None)
 
 
-def test(label, method, path, expected, data=NO_BODY, verify=None):
+def problem_fields(*fields):
+    def verify(_, __, body):
+        errors = parse_json(body).get('errors', [])
+        found = {error['field'] for error in errors if error.get('message')}
+        if not set(fields) <= found:
+            raise AssertionError(f'Expected validation errors for {fields}, got {errors}')
+    return verify
+
+
+def test(label, method, path, expected, data=NO_BODY, verify=None, **request_options):
     global checks
     checks += 1
     try:
-        status, headers, body = call(method, path, data)
+        status, headers, body = call(method, path, data, **request_options)
         # If an invalid POST was accidentally accepted, remember it for cleanup.
         if method == 'POST' and status == 201:
             loc = get_header(headers, 'Location')
@@ -249,6 +271,23 @@ def test(label, method, path, expected, data=NO_BODY, verify=None):
                     pass
         if status != expected:
             raise AssertionError(f'expected HTTP {expected}, got {status}; body={body[:350]!r}')
+        if VERIFY_PROBLEMS:
+            if 400 <= status < 600 and status != 406:
+                media = (get_header(headers, 'Content-Type') or '').split(';')[0]
+                if media != 'application/problem+json':
+                    raise AssertionError(f'Expected application/problem+json, got {media!r}')
+                problem = parse_json(body)
+                expected_fields = dict(type='about:blank', title=HTTPStatus(status).phrase,
+                                       status=status, instance=path.split('?')[0])
+                if any(problem.get(key) != value for key, value in expected_fields.items()):
+                    raise AssertionError(f'Expected {expected_fields}, got {problem}')
+                if not isinstance(problem.get('detail'), str) or not problem['detail'].strip():
+                    raise AssertionError('Expected a nonempty problem detail')
+                if status == 405 and not {'GET', 'POST'} <= set(
+                        (get_header(headers, 'Allow') or '').replace(' ', '').split(',')):
+                    raise AssertionError('Allow header must include GET and POST')
+            if status in (204, 406) and body:
+                raise AssertionError(f'Expected an empty HTTP {status} response')
         if verify:
             verify(status, headers, body)
         print(f'PASS {label} -> HTTP {status}')
@@ -344,7 +383,18 @@ def main():
                 payload.pop(key, None)
             else:
                 payload[key] = value
-        test(f'POST invalid: {label}', 'POST', '/api/slots', 400, payload)
+        check = problem_fields(*edits) if VERIFY_PROBLEMS and label not in (
+            'invalid timestamp format', 'wrong JSON value type') else None
+        test(f'POST invalid: {label}', 'POST', '/api/slots', 400, payload, verify=check)
+
+    if VERIFY_PROBLEMS:
+        test('Multiple validation errors', 'POST', '/api/slots', 400,
+             {**valid, 'facilityId': 0, 'capacity': 0}, verify=problem_fields('facilityId', 'capacity'))
+        test('Malformed JSON', 'POST', '/api/slots', 400, '{')
+        test('Missing body', 'POST', '/api/slots', 400, '')
+        test('Unsupported method and Allow header', 'PUT', '/api/slots', 405)
+        test('Unsupported media type', 'POST', '/api/slots', 415, valid, content_type='text/plain')
+        test('Unacceptable response media type', 'GET', '/api/slots', 406, accept='image/png')
 
     # Correct/incorrect comparisons when textual local times have different offsets.
     from datetime import timedelta as td
@@ -366,7 +416,9 @@ def main():
                         ('/api/slots?facilityId=0', 'zero facility filter'),
                         ('/api/slots?specialtyId=-1', 'negative specialty filter'),
                         ('/api/slots?facilityId=abc', 'nonnumeric facility filter')]:
-        test(f'GET invalid: {label}', 'GET', path, 400)
+        field = path.split('?')[1].split('=')[0] if '?' in path else 'id'
+        check = problem_fields(field) if VERIFY_PROBLEMS and 'nonnumeric' not in label else None
+        test(f'GET invalid: {label}', 'GET', path, 400, verify=check)
     test('GET positive nonexistent slot', 'GET', f'/api/slots/{missing_slot}', 404)
     test('PATCH invalid path ID', 'PATCH', '/api/slots/0', 400, {'capacity': 3})
     test('DELETE invalid path ID', 'DELETE', '/api/slots/-1', 400)

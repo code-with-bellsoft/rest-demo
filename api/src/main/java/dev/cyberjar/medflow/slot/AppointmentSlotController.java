@@ -5,7 +5,6 @@ import dev.cyberjar.medflow.slot.dto.SlotRequest;
 import dev.cyberjar.medflow.slot.dto.SlotResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -50,10 +49,5 @@ public class AppointmentSlotController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteSlot(@Positive @PathVariable Long id) {
         service.deleteSlot(id);
-    }
-
-    @ExceptionHandler(DataIntegrityViolationException.class)
-    @ResponseStatus(HttpStatus.BAD_REQUEST)
-    public void handleConstraintViolation() {
     }
 }

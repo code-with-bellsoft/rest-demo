@@ -63,7 +63,7 @@ The API uses Jakarta Bean Validation. `@Valid` tells Spring MVC to validate the 
 
 `@EndAfterStart` compares the two timestamps as instants and reports a violation on `endsAt` when the end is equal to or earlier than the start. `@ExistingFacility` and `@ExistingSpecialty` run jOOQ existence queries for positive IDs. Spring's validator factory injects the reference repository into both validators through their constructors. `@NotNull` handles missing values, and `@Positive` handles nonpositive IDs, so the lookup validators skip them.
 
-PostgreSQL foreign keys and CHECK constraints enforce integrity at write time, including when a reference changes after validation. The service delegates capacity updates and deletions to repository transactions that lock the slot before counting active bookings. This keeps the booking rule and the subsequent write in the same transaction. Spring MVC returns its default 400 responses for invalid requests. The Vaadin forms submit values via HTTP and the inspector displays the API's actual response.
+PostgreSQL foreign keys and CHECK constraints enforce integrity at write time, including when a reference changes after validation. The service delegates capacity updates and deletions to repository transactions that lock the slot before counting active bookings. This keeps the booking rule and the subsequent write in the same transaction. The Vaadin forms submit values via HTTP and the inspector displays the API's actual response.
 
 Run the smoke test against the running API with the seed fixtures present. It requires curl, jq, and Python 3. It generates timestamps relative to the current time, discovers IDs from the API, and deletes the slot it creates.
 
@@ -96,3 +96,53 @@ The reactor regenerates the jOOQ classes, runs both test suites, and packages bo
 ./mvnw -pl api test
 ./mvnw -pl ui test
 ```
+
+## Error Handling
+
+HTTP status codes tell clients how to respond. A 400 means the request needs a correction, a 404 means the requested slot is missing, and a 409 means the slot exists but its current bookings prevent the change. A valid filter with no matches returns 200 with an empty array. Successful creation still returns 201 with `Location`, and successful deletion returns 204 with an empty body.
+
+[RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html) defines a standard error representation for HTTP APIs. MedFlow uses Spring's `ProblemDetail` to serialize `application/problem+json`. The standard fields are `type` (`about:blank` uses the HTTP status meaning), `title` (the status description), `status` (the numeric HTTP status), `detail` (a human-readable explanation), and `instance` (the request path, without the query string). Branch on the HTTP status and use the detail for display. A 406 can have an empty body when the client requests an unsupported representation.
+
+A single `ResponseEntityExceptionHandler` advice adds the API's error details and lets Spring MVC handle response writing and protocol headers such as `Allow`. Body validation handles violations on the deserialized request, including the custom time and reference constraints. Method validation handles constraints on arguments such as the path ID and query filters. Both expose an `errors` array of `field` and `message` entries in arbitrary order. For a request-wide violation without a field, the entry uses `body` or `request`. Invalid JSON or parameter conversion failures return a short 400 detail.
+
+```sh
+curl -i -X POST http://localhost:8080/api/slots \
+  -H 'Content-Type: application/json' -d '{"capacity":0}'
+curl -i http://localhost:8080/api/slots/0
+```
+
+An invalid path ID produces:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "Request validation failed",
+  "instance": "/api/slots/0",
+  "errors": [{"field": "id", "message": "must be greater than 0"}]
+}
+```
+
+A POST with only `capacity: 0` also reports the missing fields:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "Request validation failed",
+  "instance": "/api/slots",
+  "errors": [
+    {"field": "facilityId", "message": "must not be null"},
+    {"field": "specialtyId", "message": "must not be null"},
+    {"field": "startsAt", "message": "must not be null"},
+    {"field": "endsAt", "message": "must not be null"},
+    {"field": "capacity", "message": "must be greater than 0"}
+  ]
+}
+```
+
+The HTTP boundary translates missing slots and booking conflicts into their public responses. Repository transactions, row locks, and database constraints continue to enforce the underlying rules. Unexpected failures return a generic 500 detail, while the server logs the failure type and location. The Vaadin client displays the detail and any field messages as plain text and keeps the original error body in the inspector.
+
+After building with `./mvnw clean verify`, run `./scripts/verify-error-handling.sh`. It uses Bash, Java, Python 3, curl, and Docker to start a disposable PostgreSQL database and API, verify the HTTP contract, and clean up test fixtures.

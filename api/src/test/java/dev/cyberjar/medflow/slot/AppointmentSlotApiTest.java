@@ -24,6 +24,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
@@ -32,6 +33,7 @@ import static dev.cyberjar.medflow.Tables.BOOKING;
 import static dev.cyberjar.medflow.Tables.FACILITY;
 import static dev.cyberjar.medflow.Tables.SPECIALTY;
 import static dev.cyberjar.medflow.enums.BookingStatus.CANCELLED;
+import static dev.cyberjar.medflow.slot.AppointmentSlotValidationTest.problem;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
@@ -200,19 +202,22 @@ class AppointmentSlotApiTest {
                 .from(APPOINTMENT_SLOT).fetchSingle().value1() + 1;
         String path = SLOTS + "/" + missing;
 
-        mvc.perform(get(path)).andExpect(status().isNotFound());
-        mvc.perform(patch(path).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}"))
-                .andExpect(status().isNotFound());
-        mvc.perform(delete(path)).andExpect(status().isNotFound());
+        for (var request : List.of(get(path), delete(path),
+                patch(path).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":3}"))) {
+            problem(mvc.perform(request), 404, "Not Found", path)
+                    .andExpect(jsonPath("$.detail").value("Slot with id " + missing + " not found"));
+        }
     }
 
     @Test
     void refusesToReduceCapacityBelowActiveBookingsOrDeleteABookedSlot() throws Exception {
         Long booked = slotId("Harbor Community Clinic", "Cardiology");
         String path = SLOTS + "/" + booked;
-        mvc.perform(patch(path).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":1}"))
-                .andExpect(status().isConflict());
-        mvc.perform(delete(path)).andExpect(status().isConflict());
+        problem(mvc.perform(patch(path).contentType(MediaType.APPLICATION_JSON).content("{\"capacity\":1}")),
+                409, "Conflict", path)
+                .andExpect(jsonPath("$.detail").value("Cannot set capacity below the 2 active bookings."));
+        problem(mvc.perform(delete(path)), 409, "Conflict", path)
+                .andExpect(jsonPath("$.detail").value("Cannot delete a slot with active bookings."));
         assertThat(db.fetchSingle(APPOINTMENT_SLOT, APPOINTMENT_SLOT.ID.eq(booked)).getCapacity()).isEqualTo(3);
         assertThat(db.fetchCount(BOOKING, BOOKING.APPOINTMENT_SLOT_ID.eq(booked))).isEqualTo(2);
     }
