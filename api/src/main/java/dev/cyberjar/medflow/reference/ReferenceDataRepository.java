@@ -31,6 +31,14 @@ public class ReferenceDataRepository {
                 .fetch(row -> new ReferenceEntry(row.value1(), row.value2()));
     }
 
+    public boolean existsFacilityById(long id) {
+        return db.fetchExists(FACILITY, FACILITY.ID.eq(id));
+    }
+
+    public boolean existsSpecialtyById(long id) {
+        return db.fetchExists(SPECIALTY, SPECIALTY.ID.eq(id));
+    }
+
     public record ReferenceEntry(Long id, String name) {
     }
 }

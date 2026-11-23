@@ -1,4 +1,7 @@
 package dev.cyberjar.medflow.slot.dto;
 
-public record CapacityRequest(Integer capacity) {
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+
+public record CapacityRequest(@NotNull @Positive Integer capacity) {
 }

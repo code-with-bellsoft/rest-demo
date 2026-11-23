@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+# MedFlow rest-01-validation verification: Maven, PostgreSQL constraints,
+# API behavior, and regression checks. Does not test the Vaadin frontend.
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+API_BASE="${API_BASE:-http://localhost:8080}"
+API_BASE="${API_BASE%/}"
+RUN_MAVEN="${RUN_MAVEN:-1}"
+START_DB="${START_DB:-1}"
+START_API="${START_API:-1}"
+CHECK_DB="${CHECK_DB:-1}"
+DB_USER="${DB_USER:-meduser}"
+DB_NAME="${DB_NAME:-medflow_rest}"
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/medflow-validation.XXXXXX")"
+API_PID=""
+cleanup() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ -n "$API_PID" ]]; then
+    echo "Stopping API process started by this script (PID $API_PID)..."
+    kill "$API_PID" 2>/dev/null || true
+    wait "$API_PID" 2>/dev/null || true
+  fi
+  if (( exit_code != 0 )) && [[ -s "$WORK_DIR/api.log" ]]; then
+    echo "--- Last 50 lines of API log ---" >&2
+    tail -50 "$WORK_DIR/api.log" >&2
+  fi
+  rm -rf "$WORK_DIR"
+  exit "$exit_code"
+}
+trap cleanup EXIT
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
+need curl
+need python3
+
+if [[ ! -f api/pom.xml || ! -f pom.xml ]]; then
+  echo "Put this script in the medflow-rest-demo repository root (beside pom.xml and api/)." >&2
+  exit 1
+fi
+
+printf '\n== 1/5: Git working-tree sanity ==\n'
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git diff --check
+  git diff --cached --check
+  echo "Git diff whitespace checks: OK"
+else
+  echo "Git checkout not detected; skipped git diff --check."
+fi
+
+if [[ "$RUN_MAVEN" == 1 ]]; then
+  printf '\n== 2/5: Full Maven build and automated test suite ==\n'
+  if [[ -x ./mvnw ]]; then
+    ./mvnw clean verify
+  else
+    need mvn
+    mvn clean verify
+  fi
+else
+  echo "== 2/5: Maven verification skipped (RUN_MAVEN=0) =="
+fi
+
+if [[ "$START_DB" == 1 || "$CHECK_DB" == 1 ]]; then
+  need docker
+  docker compose version >/dev/null
+fi
+
+if [[ "$START_DB" == 1 ]]; then
+  printf '\n== 3/5: Start isolated PostgreSQL (non-destructive) ==\n'
+  if [[ -z "${MEDFLOW_DB_PASSWORD:-}" ]]; then
+    echo "Export MEDFLOW_DB_PASSWORD first (same password as your existing Compose volume)." >&2
+    exit 1
+  fi
+  docker compose up -d postgres
+else
+  echo "== 3/5: Compose start skipped (START_DB=0) =="
+fi
+
+printf '\n== 4/5: Check/start MedFlow API ==\n'
+if curl -fsS --max-time 3 "$API_BASE/api/facilities" >/dev/null 2>&1; then
+  echo "Using API already running at $API_BASE (will not stop it)."
+elif [[ "$START_API" == 1 ]]; then
+  if [[ -z "${MEDFLOW_DB_PASSWORD:-}" ]]; then
+    echo "Export MEDFLOW_DB_PASSWORD to start the API." >&2
+    exit 1
+  fi
+  if [[ -x ./mvnw ]]; then
+    ./mvnw -pl api spring-boot:run >"$WORK_DIR/api.log" 2>&1 &
+  else
+    mvn -pl api spring-boot:run >"$WORK_DIR/api.log" 2>&1 &
+  fi
+  API_PID=$!
+  ready=0
+  for (( i=0; i<90; i++ )); do
+    if curl -fsS --max-time 2 "$API_BASE/api/facilities" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$API_PID" 2>/dev/null; then
+      echo "API process stopped before becoming ready." >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  if [[ "$ready" != 1 ]]; then
+    echo "API did not become ready within 180 seconds." >&2
+    exit 1
+  fi
+  echo "API started at $API_BASE (PID $API_PID)."
+else
+  echo "The API is not responding at $API_BASE. Start it separately or set START_API=1." >&2
+  exit 1
+fi
+
+if [[ "$CHECK_DB" == 1 ]]; then
+  printf '\n== 4b/5: Verify actual PostgreSQL constraints and booking counts ==\n'
+  # SQL blocks below deliberately cannot persist changes: they test invalid INSERTs.
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" <<'SQL'
+DO $verify$
+DECLARE
+  facility_ref bigint;
+  specialty_ref bigint;
+  unknown_facility bigint;
+BEGIN
+  SELECT id INTO facility_ref FROM facility ORDER BY id LIMIT 1;
+  SELECT id INTO specialty_ref FROM specialty ORDER BY id LIMIT 1;
+  SELECT COALESCE(MAX(id), 0) + 1000000 INTO unknown_facility FROM facility;
+  IF facility_ref IS NULL OR specialty_ref IS NULL THEN
+    RAISE EXCEPTION 'Fixture database has no facility/specialty reference data';
+  END IF;
+
+  BEGIN
+    INSERT INTO appointment_slot (facility_id, specialty_id, starts_at, ends_at, capacity)
+    VALUES (facility_ref, specialty_ref, now() + interval '10 days', now() + interval '11 days', 0);
+    RAISE EXCEPTION 'FAIL: database accepted capacity 0';
+  EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'PASS: database rejects zero capacity (CHECK)';
+  END;
+
+  BEGIN
+    INSERT INTO appointment_slot (facility_id, specialty_id, starts_at, ends_at, capacity)
+    VALUES (facility_ref, specialty_ref, now() + interval '11 days', now() + interval '10 days', 1);
+    RAISE EXCEPTION 'FAIL: database accepted end time before start time';
+  EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'PASS: database rejects reversed times (CHECK)';
+  END;
+
+  BEGIN
+    INSERT INTO appointment_slot (facility_id, specialty_id, starts_at, ends_at, capacity)
+    VALUES (unknown_facility, specialty_ref, now() + interval '10 days', now() + interval '11 days', 1);
+    RAISE EXCEPTION 'FAIL: database accepted nonexistent facility';
+  EXCEPTION WHEN foreign_key_violation THEN
+    RAISE NOTICE 'PASS: database rejects unknown facility (FOREIGN KEY)';
+  END;
+END
+$verify$;
+SQL
+
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" -A -t -F '|' \
+    -c "SELECT s.id, COUNT(b.id) FILTER (WHERE b.status::text IN ('RESERVED','CONFIRMED')) FROM appointment_slot s LEFT JOIN booking b ON b.appointment_slot_id=s.id GROUP BY s.id ORDER BY s.id;" \
+    > "$WORK_DIR/booking_counts.txt"
+else
+  echo "Direct database checks skipped (CHECK_DB=0); Maven integration tests still run unless skipped."
+  : > "$WORK_DIR/booking_counts.txt"
+fi
+
+printf '\n== 5/5: Live HTTP validation and behavior checks ==\n'
+API_BASE="$API_BASE" BOOKING_COUNTS_FILE="$WORK_DIR/booking_counts.txt" CHECK_DB="$CHECK_DB" DB_USER="$DB_USER" DB_NAME="$DB_NAME" python3 - <<'PY'
+import copy
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+BASE = os.environ['API_BASE']
+NO_BODY = object()
+checks = 0
+failures = []
+created_paths = []
+
+
+def call(method, path, data=NO_BODY):
+    url = urllib.parse.urljoin(BASE + '/', path.lstrip('/'))
+    headers = {'Accept': 'application/json'}
+    payload = None
+    if data is not NO_BODY:
+        headers['Content-Type'] = 'application/json'
+        payload = json.dumps(data).encode('utf-8')
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return response.status, dict(response.headers.items()), response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers.items()), exc.read().decode('utf-8', 'replace')
+
+
+def run_sql(sql):
+    command = ['docker', 'compose', 'exec', '-T', 'postgres', 'psql',
+               '-X', '-v', 'ON_ERROR_STOP=1',
+               '-U', os.environ['DB_USER'], '-d', os.environ['DB_NAME'],
+               '-A', '-t', '-c', sql]
+    done = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if done.returncode != 0:
+        raise RuntimeError(f'PostgreSQL command failed: {done.stderr.strip()}')
+    return done.stdout
+
+
+def parse_json(body):
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f'Expected JSON; got {body[:160]!r}') from exc
+
+
+def get_header(headers, name):
+    return next((v for k, v in headers.items() if k.lower() == name.lower()), None)
+
+
+def test(label, method, path, expected, data=NO_BODY, verify=None):
+    global checks
+    checks += 1
+    try:
+        status, headers, body = call(method, path, data)
+        # If an invalid POST was accidentally accepted, remember it for cleanup.
+        if method == 'POST' and status == 201:
+            loc = get_header(headers, 'Location')
+            if loc:
+                candidate = urllib.parse.urlparse(urllib.parse.urljoin(BASE, loc)).path
+                if candidate.startswith('/api/slots/'):
+                    created_paths.append(candidate)
+            else:
+                try:
+                    candidate_id = int(parse_json(body)['id'])
+                    created_paths.append(f'/api/slots/{candidate_id}')
+                except (ValueError, TypeError, KeyError, AssertionError):
+                    pass
+        if status != expected:
+            raise AssertionError(f'expected HTTP {expected}, got {status}; body={body[:350]!r}')
+        if verify:
+            verify(status, headers, body)
+        print(f'PASS {label} -> HTTP {status}')
+        return status, headers, body
+    except Exception as exc:
+        print(f'FAIL {label}: {exc}')
+        failures.append((label, str(exc)))
+        return None
+
+
+def require(label, condition, message):
+    global checks
+    checks += 1
+    if condition:
+        print(f'PASS {label}')
+    else:
+        print(f'FAIL {label}: {message}')
+        failures.append((label, message))
+
+
+def required_list(path):
+    status, _, body = call('GET', path)
+    if status != 200:
+        raise AssertionError(f'{path} returned HTTP {status}: {body[:300]}')
+    value = parse_json(body)
+    if not isinstance(value, list) or not value:
+        raise AssertionError(f'{path} must return a non-empty JSON array for these tests')
+    return value
+
+
+def json_list_200(_, __, body):
+    if not isinstance(parse_json(body), list):
+        raise AssertionError('Expected JSON array')
+
+
+def main():
+    facilities = required_list('/api/facilities')
+    specialties = required_list('/api/specialties')
+    initial_slots = required_list('/api/slots')
+    facility_id = int(facilities[0]['id'])
+    specialty_id = int(specialties[0]['id'])
+    missing_facility = max(int(f['id']) for f in facilities) + 1_000_000
+    missing_specialty = max(int(s['id']) for s in specialties) + 1_000_000
+    missing_slot = max(int(s['id']) for s in initial_slots) + 1_000_000
+
+    test('GET facilities', 'GET', '/api/facilities', 200, verify=json_list_200)
+    test('GET specialties', 'GET', '/api/specialties', 200, verify=json_list_200)
+    test('GET all slots', 'GET', '/api/slots', 200, verify=json_list_200)
+    test('GET existing slot', 'GET', f'/api/slots/{initial_slots[0]["id"]}', 200)
+    test('GET facility filter', 'GET', f'/api/slots?facilityId={facility_id}', 200, verify=json_list_200)
+    test('GET specialty filter', 'GET', f'/api/slots?specialtyId={specialty_id}', 200, verify=json_list_200)
+    test('GET combined filter', 'GET', f'/api/slots?facilityId={facility_id}&specialtyId={specialty_id}', 200, verify=json_list_200)
+    def empty_list(_, __, body):
+        if parse_json(body) != []:
+            raise AssertionError('Positive nonexistent filter should return []')
+    test('GET nonexistent positive filter', 'GET', f'/api/slots?facilityId={missing_facility}', 200, verify=empty_list)
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start = now + timedelta(days=14)
+    end = start + timedelta(minutes=30)
+    iso = lambda d: d.isoformat()
+    valid = {'facilityId': facility_id, 'specialtyId': specialty_id,
+             'startsAt': iso(start), 'endsAt': iso(end), 'capacity': 3}
+
+    # Each invalid request changes exactly one concern whenever possible.
+    cases = {
+        'missing facilityId': {'facilityId': NO_BODY},
+        'null facilityId': {'facilityId': None},
+        'zero facilityId': {'facilityId': 0},
+        'negative facilityId': {'facilityId': -1},
+        'unknown facilityId (@ExistingFacility)': {'facilityId': missing_facility},
+        'missing specialtyId': {'specialtyId': NO_BODY},
+        'null specialtyId': {'specialtyId': None},
+        'zero specialtyId': {'specialtyId': 0},
+        'negative specialtyId': {'specialtyId': -1},
+        'unknown specialtyId (@ExistingSpecialty)': {'specialtyId': missing_specialty},
+        'missing startsAt': {'startsAt': NO_BODY},
+        'null startsAt': {'startsAt': None},
+        'past startsAt': {'startsAt': iso(now - timedelta(days=1))},
+        'missing endsAt': {'endsAt': NO_BODY},
+        'null endsAt': {'endsAt': None},
+        'past endsAt': {'endsAt': iso(now - timedelta(days=1))},
+        'equal start/end (@EndAfterStart)': {'endsAt': iso(start)},
+        'reversed start/end (@EndAfterStart)': {'endsAt': iso(start - timedelta(minutes=30))},
+        'missing capacity': {'capacity': NO_BODY},
+        'null capacity': {'capacity': None},
+        'zero capacity': {'capacity': 0},
+        'negative capacity': {'capacity': -3},
+        'invalid timestamp format': {'startsAt': 'not-a-timestamp'},
+        'wrong JSON value type': {'capacity': 'abc'},
+    }
+    for label, edits in cases.items():
+        payload = copy.deepcopy(valid)
+        for key, value in edits.items():
+            if value is NO_BODY:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        test(f'POST invalid: {label}', 'POST', '/api/slots', 400, payload)
+
+    # Correct/incorrect comparisons when textual local times have different offsets.
+    from datetime import timedelta as td
+    start_offset = start.astimezone(timezone(td(hours=5)))
+    end_offset = end.astimezone(timezone(td(hours=-5)))
+    earlier_offset = (start - td(minutes=30)).astimezone(timezone(td(hours=-5)))
+    test('POST reversed instants across offsets', 'POST', '/api/slots', 400,
+         {**valid, 'startsAt': iso(start_offset), 'endsAt': iso(earlier_offset)})
+
+    after_invalid = required_list('/api/slots')
+    before_state = {int(s['id']): s for s in initial_slots}
+    after_state = {int(s['id']): s for s in after_invalid}
+    require('Invalid POSTs did not change existing slots', before_state == after_state,
+            'Slot collection changed after rejected POST requests')
+
+    for path, label in [('/api/slots/0', 'zero path ID'),
+                        ('/api/slots/-1', 'negative path ID'),
+                        ('/api/slots/abc', 'nonnumeric path ID'),
+                        ('/api/slots?facilityId=0', 'zero facility filter'),
+                        ('/api/slots?specialtyId=-1', 'negative specialty filter'),
+                        ('/api/slots?facilityId=abc', 'nonnumeric facility filter')]:
+        test(f'GET invalid: {label}', 'GET', path, 400)
+    test('GET positive nonexistent slot', 'GET', f'/api/slots/{missing_slot}', 404)
+    test('PATCH invalid path ID', 'PATCH', '/api/slots/0', 400, {'capacity': 3})
+    test('DELETE invalid path ID', 'DELETE', '/api/slots/-1', 400)
+
+    # Availability checks against real booking rows, when DB verification is enabled.
+    db_counts = {}
+    with open(os.environ['BOOKING_COUNTS_FILE'], encoding='utf-8') as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            slot_id, count = line.strip().split('|')
+            db_counts[int(slot_id)] = int(count)
+    for s in initial_slots:
+        sid = int(s['id'])
+        if 'activeBookings' not in s or 'remainingCapacity' not in s:
+            require(f'Availability properties for slot {sid}', False,
+                    'Response missing activeBookings or remainingCapacity')
+            continue
+        active = int(s['activeBookings'])
+        capacity = int(s['capacity'])
+        remaining = int(s['remainingCapacity'])
+        require(f'Remaining capacity for slot {sid}', remaining == capacity - active,
+                f'capacity={capacity}, activeBookings={active}, remainingCapacity={remaining}')
+        if db_counts:
+            require(f'Booking count matches PostgreSQL for slot {sid}', active == db_counts.get(sid),
+                    f'API={active}, DB={db_counts.get(sid)}')
+
+    # Use a temporary, disposable booked slot for destructive conflict tests.
+    # Never attempt to delete the repository's seeded booked appointments.
+    if os.environ['CHECK_DB'] == '1':
+        def confirm_fixture(_, __, body):
+            if not isinstance(parse_json(body).get('id'), int):
+                raise AssertionError('Temporary slot has no numeric ID')
+        temp_created = test('POST temporary slot for business-rule tests', 'POST',
+                            '/api/slots', 201, valid, confirm_fixture)
+        if temp_created:
+            temp_id = int(parse_json(temp_created[2])['id'])
+            temp_path = f'/api/slots/{temp_id}'
+            try:
+                run_sql(f"INSERT INTO booking (appointment_slot_id, status) VALUES "
+                        f"({temp_id}, 'RESERVED'), ({temp_id}, 'CONFIRMED'), "
+                        f"({temp_id}, 'CANCELLED'), ({temp_id}, 'NO_SHOW');")
+                def assert_two_active(_, __, body):
+                    slot = parse_json(body)
+                    if int(slot['activeBookings']) != 2 or int(slot['remainingCapacity']) != 1:
+                        raise AssertionError(f'Expected 2 active and 1 remaining; got {slot}')
+                test('Reserved+confirmed count; cancelled+no-show excluded',
+                     'GET', temp_path, 200, verify=assert_two_active)
+                test('PATCH below booked count (409)', 'PATCH', temp_path, 409,
+                     {'capacity': 1})
+                test('409 PATCH did not mutate temporary slot', 'GET', temp_path, 200,
+                     verify=lambda _, __, b: require('Capacity stays 3 after conflict',
+                             int(parse_json(b)['capacity']) == 3, 'capacity changed'))
+                test('DELETE booked temporary slot (409)', 'DELETE', temp_path, 409)
+                test('409 DELETE leaves temporary slot intact', 'GET', temp_path, 200)
+
+                # Leave CANCELLED and NO_SHOW in place to prove neither blocks deletion.
+                run_sql(f"DELETE FROM booking WHERE appointment_slot_id = {temp_id} "
+                        "AND status::text IN ('RESERVED', 'CONFIRMED');")
+                def assert_zero_active(_, __, body):
+                    slot = parse_json(body)
+                    if int(slot['activeBookings']) != 0 or int(slot['remainingCapacity']) != 3:
+                        raise AssertionError(f'Inactive-only bookings should leave 3 places: {slot}')
+                test('Cancelled+no-show bookings do not count', 'GET', temp_path,
+                     200, verify=assert_zero_active)
+                deleted_temp = test('DELETE slot with inactive-only bookings (204)',
+                                    'DELETE', temp_path, 204)
+                if deleted_temp and temp_path in created_paths:
+                    created_paths.remove(temp_path)
+            except Exception as exc:
+                failures.append(('Temporary booking fixture', str(exc)))
+                print(f'FAIL Temporary booking fixture: {exc}')
+    else:
+        print('SKIP direct-DB booking fixture tests (CHECK_DB=0); these require PostgreSQL access.')
+
+    # Valid create -> read -> update -> delete -> missing-resource behavior.
+    def assert_created(_, headers, body):
+        if not get_header(headers, 'Location'):
+            raise AssertionError('201 response lacks Location header')
+        if not isinstance(parse_json(body).get('id'), int):
+            raise AssertionError('201 response lacks numeric JSON id')
+    created = test('POST valid slot', 'POST', '/api/slots', 201, valid, assert_created)
+    if created:
+        _, headers, body = created
+        slot_id = int(parse_json(body)['id'])
+        path = f'/api/slots/{slot_id}'
+        location = get_header(headers, 'Location')
+        resolved_path = urllib.parse.urlparse(urllib.parse.urljoin(BASE, location)).path
+        require('POST Location identifies created slot', resolved_path == path,
+                f'Location={location!r}, expected path={path}')
+        if path not in created_paths:
+            created_paths.append(path)
+
+        test('GET created slot', 'GET', path, 200)
+        for label, payload in [('zero PATCH capacity', {'capacity': 0}),
+                               ('negative PATCH capacity', {'capacity': -2}),
+                               ('null PATCH capacity', {'capacity': None}),
+                               ('missing PATCH capacity', {}),
+                               ('wrong-type PATCH capacity', {'capacity': 'abc'})]:
+            test(label, 'PATCH', path, 400, payload)
+        _, _, state_body = call('GET', path)
+        require('Invalid PATCHes leave capacity unchanged',
+                int(parse_json(state_body)['capacity']) == 3,
+                'Invalid PATCH changed the created slot capacity')
+        def capacity_four(_, __, body):
+            if int(parse_json(body)['capacity']) != 4:
+                raise AssertionError('Updated response did not contain capacity 4')
+        test('PATCH valid capacity', 'PATCH', path, 200, {'capacity': 4}, capacity_four)
+        test('GET after PATCH', 'GET', path, 200,
+             verify=lambda _, __, b: require('PATCH persisted capacity',
+                       int(parse_json(b)['capacity']) == 4, 'GET did not return capacity 4'))
+        deleted = test('DELETE created slot', 'DELETE', path, 204)
+        if deleted:
+            created_paths.remove(path)
+        test('GET deleted slot (404)', 'GET', path, 404)
+        test('PATCH deleted slot (404)', 'PATCH', path, 404, {'capacity': 3})
+        test('DELETE deleted slot again (404)', 'DELETE', path, 404)
+
+    test('PATCH positive nonexistent slot (404)', 'PATCH', f'/api/slots/{missing_slot}', 404, {'capacity': 3})
+    test('DELETE positive nonexistent slot (404)', 'DELETE', f'/api/slots/{missing_slot}', 404)
+
+    # Cross-offset valid request should pass (end instant later, local clock earlier).
+    offset_valid = {**valid, 'startsAt': iso(start_offset), 'endsAt': iso(end_offset)}
+    test('POST valid instants across different offsets', 'POST', '/api/slots', 201, offset_valid)
+
+    final_slots = required_list('/api/slots')
+    initial_ids = {int(s['id']) for s in initial_slots}
+    final_ids = {int(s['id']) for s in final_slots}
+    created_ids = {int(path.rsplit('/', 1)[1]) for path in created_paths}
+    require('Only deliberately created test slots remain for cleanup',
+            final_ids - created_ids == initial_ids,
+            'Unexpected changes in existing slot IDs')
+
+
+try:
+    main()
+except Exception as exc:
+    failures.append(('Setup or unexpected test exception', str(exc)))
+    print(f'FAIL Setup or unexpected test exception: {exc}')
+finally:
+    # Clean only resources created by this test run, even after a failure.
+    for path in dict.fromkeys(created_paths):
+        try:
+            if os.environ['CHECK_DB'] == '1':
+                # Only paths of resources created by this test run are tracked here.
+                slot_id = int(path.rsplit('/', 1)[1])
+                run_sql(f'DELETE FROM booking WHERE appointment_slot_id = {slot_id};')
+            status, _, body = call('DELETE', path)
+            if status not in (204, 404):
+                failures.append(('Cleanup', f'{path} could not be deleted: HTTP {status} {body[:160]}'))
+                print(f'FAIL Cleanup {path}: HTTP {status}')
+        except Exception as exc:
+            failures.append(('Cleanup', f'{path}: {exc}'))
+            print(f'FAIL Cleanup {path}: {exc}')
+
+print(f'\nRESULT: {checks - len([f for f in failures if f[0] not in ("Cleanup", "Setup or unexpected test exception")])}/{checks} HTTP/invariant checks passed, {len(failures)} failures in total.')
+if failures:
+    print('\nFailed checks:')
+    for label, detail in failures:
+        print(f'  - {label}: {detail}')
+    sys.exit(1)
+sys.exit(0)
+PY
+
+printf '\nAll requested automated and live API/database checks passed. Vaadin was not tested.\n'

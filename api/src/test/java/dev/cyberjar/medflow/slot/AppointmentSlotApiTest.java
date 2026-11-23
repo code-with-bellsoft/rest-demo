@@ -1,13 +1,16 @@
 package dev.cyberjar.medflow.slot;
 
 import dev.cyberjar.medflow.enums.BookingStatus;
+import dev.cyberjar.medflow.slot.dto.SlotRequest;
 import org.jooq.DSLContext;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -18,6 +21,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
+import java.sql.SQLException;
 import java.time.OffsetDateTime;
 
 import static dev.cyberjar.medflow.Tables.APPOINTMENT_SLOT;
@@ -26,6 +30,7 @@ import static dev.cyberjar.medflow.Tables.FACILITY;
 import static dev.cyberjar.medflow.Tables.SPECIALTY;
 import static dev.cyberjar.medflow.enums.BookingStatus.CANCELLED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.is;
 import static org.jooq.impl.DSL.max;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -54,6 +59,9 @@ class AppointmentSlotApiTest {
 
     @Autowired
     DSLContext db;
+
+    @Autowired
+    AppointmentSlotRepository repository;
 
     @Test
     void listsAllSeededSlotsInOrderIncludingTheFullyBookedSlot() throws Exception {
@@ -103,6 +111,16 @@ class AppointmentSlotApiTest {
                 .andExpect(jsonPath("$.length()").value(1))
                 .andExpect(jsonPath("$[0].id").value(is(slotId("Harbor Community Clinic", "Cardiology")), Long.class))
                 .andExpectAll(availability("$[0]", 2, 1));
+    }
+
+    @Test
+    void returnsEmptyCollectionForUnknownPositiveFilters() throws Exception {
+        mvc.perform(get(SLOTS).param("facilityId", missingFacilityId().toString()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(0));
+        mvc.perform(get(SLOTS).param("specialtyId", missingSpecialtyId().toString()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(0));
     }
 
     @Test
@@ -197,6 +215,18 @@ class AppointmentSlotApiTest {
 
     @Test
     @Transactional
+    void permitsCapacityEqualToActiveBookings() throws Exception {
+        Long booked = slotId("Harbor Community Clinic", "Cardiology");
+        mvc.perform(patch(SLOTS + "/{id}", booked).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"capacity\":2}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.capacity").value(2))
+                .andExpectAll(availability("$", 2, 0));
+        assertThat(db.fetchSingle(APPOINTMENT_SLOT, APPOINTMENT_SLOT.ID.eq(booked)).getCapacity()).isEqualTo(2);
+    }
+
+    @Test
+    @Transactional
     void permitsRemovingASlotWithOnlyACancelledBooking() throws Exception {
         Long cancelled = slotId("Downtown General Hospital", "General Medicine");
         assertThat(db.fetchSingle(BOOKING, BOOKING.APPOINTMENT_SLOT_ID.eq(cancelled)).getStatus())
@@ -209,14 +239,47 @@ class AppointmentSlotApiTest {
         assertThat(db.fetchExists(BOOKING, BOOKING.APPOINTMENT_SLOT_ID.eq(cancelled))).isFalse();
     }
 
-    @Test
-    void rejectsAnInvalidTimeRangeAsABadRequest() throws Exception {
-        OffsetDateTime start = OffsetDateTime.now().plusDays(14);
+    @ParameterizedTest
+    @ValueSource(strings = {"time order", "facility", "specialty", "capacity"})
+    void rejectsInvalidCreationWithoutPersistingASlot(String invalidField) throws Exception {
+        var request = invalidSlotRequest(invalidField);
+        int before = db.fetchCount(APPOINTMENT_SLOT);
         mvc.perform(post(SLOTS).contentType(MediaType.APPLICATION_JSON).content("""
-                        {"facilityId": %d, "specialtyId": %d, "startsAt": "%s", "endsAt": "%s", "capacity": 2}
-                        """.formatted(facilityId("Harbor Community Clinic"), specialtyId("Cardiology"),
-                        start, start.minusMinutes(30))))
+                        {"facilityId": %d, "specialtyId": %d, "startsAt": "%s", "endsAt": "%s", "capacity": %d}
+                        """.formatted(request.facilityId(), request.specialtyId(), request.startsAt(),
+                        request.endsAt(), request.capacity())))
                 .andExpect(status().isBadRequest());
+        assertThat(db.fetchCount(APPOINTMENT_SLOT)).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"time order, 23514", "capacity, 23514", "facility, 23503", "specialty, 23503"})
+    void postgresEnforcesChecksAndForeignKeysWhenRequestValidationIsBypassed(String invalidField, String sqlState) {
+        var request = invalidSlotRequest(invalidField);
+        int before = db.fetchCount(APPOINTMENT_SLOT);
+
+        assertThatThrownBy(() -> repository.createSlot(request))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .rootCause().isInstanceOfSatisfying(SQLException.class,
+                        cause -> assertThat(cause.getSQLState()).isEqualTo(sqlState));
+        assertThat(db.fetchCount(APPOINTMENT_SLOT)).isEqualTo(before);
+    }
+
+    private SlotRequest invalidSlotRequest(String invalidField) {
+        var start = OffsetDateTime.now().plusDays(14);
+        return new SlotRequest(
+                invalidField.equals("facility") ? missingFacilityId() : facilityId("Harbor Community Clinic"),
+                invalidField.equals("specialty") ? missingSpecialtyId() : specialtyId("Cardiology"),
+                start, invalidField.equals("time order") ? start.minusMinutes(30) : start.plusMinutes(30),
+                invalidField.equals("capacity") ? 0 : 2);
+    }
+
+    private Long missingFacilityId() {
+        return db.select(max(FACILITY.ID)).from(FACILITY).fetchSingle().value1() + 1;
+    }
+
+    private Long missingSpecialtyId() {
+        return db.select(max(SPECIALTY.ID)).from(SPECIALTY).fetchSingle().value1() + 1;
     }
 
     private ResultMatcher[] availability(String path, int activeBookings, int remainingCapacity) {

@@ -15,7 +15,7 @@ The root Maven project builds both modules. Each module starts its own Spring Bo
 
 ## Run locally
 
-Install Java 25, Node.js 24 LTS for Vaadin's frontend tooling, and Docker with Compose. Run the commands from the repository root. In one terminal, start PostgreSQL and the API.
+Install Java 25  and Docker with Compose. Run the commands from the repository root. In one terminal, start PostgreSQL and the API.
 
 ```sh
 export MEDFLOW_DB_PASSWORD=medpass
@@ -28,8 +28,7 @@ The API connects to `localhost:5434/medflow_rest` as `meduser`. Flyway applies t
 In a second terminal, start the UI.
 
 ```sh
-./mvnw -pl ui package
-java -jar ui/target/ui-0.0.1-SNAPSHOT.jar
+./mvnw -pl ui spring-boot:run
 ```
 
 Open [MedFlow on port 8081](http://localhost:8081). The UI reads its API address from `medflow.api.base-url`, which defaults to `http://localhost:8080`. Override it with `MEDFLOW_API_BASE_URL` when needed.
@@ -54,30 +53,23 @@ The create form uses UTC, and the grid displays the offset from the API response
 
 The collection accepts optional `facilityId` and `specialtyId` query parameters. Requests for a missing slot return 404. A capacity reduction below the active booking count or deletion of a slot with active bookings returns 409.
 
-[requests.http](requests.http) contains runnable examples for the JetBrains HTTP Client. Run them in order on a fresh database. With curl and jq, you can start by fetching the reference IDs and creating a slot.
+[requests.http](requests.http) contains optional examples for the JetBrains HTTP Client.
+
+Slot responses include `activeBookings` and `remainingCapacity`. Remaining capacity is total capacity minus the count of reserved and confirmed bookings. The grid displays these API values as Capacity, Booked, and Remaining. Follow the `Location` header after creating a slot to retrieve it.
+
+## Validation
+
+The API uses Jakarta Bean Validation. `@Valid` tells Spring MVC to validate the deserialized request body before invoking the controller. Creating a slot requires positive facility and specialty IDs, future start and end timestamps, and positive capacity. Capacity updates require a positive capacity. Slot path IDs and supplied collection filters must be positive. Positive filter values with no matches return an empty list.
+
+`@EndAfterStart` compares the two timestamps as instants and reports a violation on `endsAt` when the end is equal to or earlier than the start. `@ExistingFacility` and `@ExistingSpecialty` run jOOQ existence queries for positive IDs. Spring's validator factory injects the reference repository into both validators through their constructors. `@NotNull` handles missing values, and `@Positive` handles nonpositive IDs, so the lookup validators skip them.
+
+PostgreSQL foreign keys and CHECK constraints enforce integrity at write time, including when a reference changes after validation. The service delegates capacity updates and deletions to repository transactions that lock the slot before counting active bookings. This keeps the booking rule and the subsequent write in the same transaction. Spring MVC returns its default 400 responses for invalid requests. The Vaadin forms submit values via HTTP and the inspector displays the API's actual response.
+
+Run the smoke test against the running API with the seed fixtures present. It requires curl, jq, and Python 3. It generates timestamps relative to the current time, discovers IDs from the API, and deletes the slot it creates.
 
 ```sh
-facility_id=$(curl -fsS localhost:8080/api/facilities | jq '.[0].id')
-specialty_id=$(curl -fsS localhost:8080/api/specialties | jq '.[0].id')
-
-curl -i -H 'Content-Type: application/json' \
-  -d "{\"facilityId\":${facility_id},\"specialtyId\":${specialty_id},\"startsAt\":\"2030-05-01T10:00:00Z\",\"endsAt\":\"2030-05-01T10:30:00Z\",\"capacity\":2}" \
-  localhost:8080/api/slots
+./scripts/validation-smoke.sh
 ```
-
-For example, a fresh database can return:
-
-```http
-HTTP/1.1 201
-Location: /api/slots/5
-Content-Type: application/json
-
-{"id":5,"facilityId":2,"facilityName":"Downtown General Hospital","specialtyId":2,"specialtyName":"Cardiology","startsAt":"2030-05-01T10:00:00Z","endsAt":"2030-05-01T10:30:00Z","capacity":2,"activeBookings":0,"remainingCapacity":2}
-```
-
-Slot responses include `activeBookings` and `remainingCapacity`. Remaining capacity is total capacity minus the count of reserved and confirmed bookings. The Grid displays these API values as Capacity, Booked, and Remaining.
-
-Follow the returned `Location` to retrieve the slot. Send a PATCH to the same path with `{"capacity":3}` to change capacity.
 
 ## Fixtures
 
@@ -96,7 +88,7 @@ The 30-minute slots start seven through ten days after Flyway seeds the database
 ./mvnw clean verify
 ```
 
-The reactor regenerates the jOOQ classes, runs both test suites, and packages both Spring Boot applications, including Vaadin's browser bundle. API tests use MockMvc and a fresh PostgreSQL Testcontainer with its own credentials. UI tests use a local HTTP test server and can run independently of PostgreSQL and Docker.
+The reactor regenerates the jOOQ classes, runs both test suites, and packages both Spring Boot applications, including Vaadin's browser bundle. API tests use MockMvc for validation and a fresh PostgreSQL Testcontainer for persistence and transactional behavior. UI tests use a local HTTP test server and can run independently of PostgreSQL and Docker.
 
 ```sh
 ./mvnw -pl api test
